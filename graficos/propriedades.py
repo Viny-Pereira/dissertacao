@@ -19,11 +19,13 @@ def modelo_voce(eps_p, sig_y0, Q_inf, b):
 # 2. LEITURA E CONVERSÃO DOS DADOS
 # ==========================================
 try:
+    strain = 'True_Strain2'
+    stress = 'True_Stress2'
     arquivo_excel = "dados_chawla1998.xlsx"
-    df = pd.read_excel(arquivo_excel, sheet_name='vf=0').dropna(subset=['True_Strain2', 'True_Stress2']).sort_values(by='True_Strain2')
+    df = pd.read_excel(arquivo_excel, sheet_name='vf=0').dropna(subset=[strain, stress]).sort_values(by=strain)
     
-    eps_true = df["True_Strain2"].values - df["True_Strain2"].values[0]
-    sig_true = df["True_Stress2"].values - df["True_Stress2"].values[0]
+    eps_true = df[strain].values - df[strain].values[0]
+    sig_true = df[stress].values - df[stress].values[0]
 
     eps_eng = np.exp(eps_true) - 1
     sig_eng = sig_true / np.exp(eps_true) 
