@@ -273,6 +273,7 @@ def micro_model_3D(epsM, nodes):
 
 # MAIN FUNCTION
 def rve_msh2dat(msh_file, E_modulus, nu_poisson, epsM):
+    
     """
     Main function to read a Gmsh .msh file and generate a .dat file
     """ 

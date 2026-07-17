@@ -1,7 +1,7 @@
 import math
 import gmsh
 from gmshModel.Model import SimpleCubicCell, RandomInclusionRVE
-from dissertacao.script.msh2dat_3D import rve_msh2dat
+from msh2dat_3D import rve_msh2dat
 import os
 import shutil
 import numpy as np
@@ -243,7 +243,6 @@ class RVEGenerator:
             "domainGroup": "matrix",
             "inclusionGroup": "inclusion"
         }
-        from gmshModel.Model import SimpleCubicCell
         self.rve_model = SimpleCubicCell(**init_params)
         self._construir_geometria_e_malha()
         print(f"RVE de Fibra gerado. Raio: {self.r:.4f}")
@@ -256,7 +255,7 @@ if __name__ == "__main__":
     # Note: vf=0 pode causar singularidade na geometria. Foi adicionado um patch lá em cima.
     fracoes_volume = [5, 10, 20, 30]  
     fracoes_volume = [30]  
-    ordens_elem = [2]  
+    ordens_elem = [1]  
     malhas = [0.3, 0.2, 0.15, 0.10, 0.075, 0.05]
     malhas = [0.3, 0.2, 0.15, 0.10]
     malhas = [0.045, 0.04,0.035]
