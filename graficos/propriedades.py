@@ -22,7 +22,7 @@ try:
     strain = 'True_Strain2'
     stress = 'True_Stress2'
     arquivo_excel = "dados_chawla1998.xlsx"
-    df = pd.read_excel(arquivo_excel, sheet_name='vf=0').dropna(subset=[strain, stress]).sort_values(by=strain)
+    df = pd.read_excel(arquivo_excel, sheet_name='vf=20').dropna(subset=[strain, stress]).sort_values(by=strain)
     
     eps_true = df[strain].values - df[strain].values[0]
     sig_true = df[stress].values - df[stress].values[0]
