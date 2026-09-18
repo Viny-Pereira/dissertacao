@@ -37,12 +37,29 @@
 *.out
 *.app
 
-# debug information files
+# Debug information files
 *.dwo
 
-# img
+# Images
 *.png
 *.jpg
 *.jpeg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Python package metadata
+*.egg-info/
+
+# Virtual environment
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# weight 
+*.pth
 
 congresso/
