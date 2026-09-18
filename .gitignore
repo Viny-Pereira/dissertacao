@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+
+# img
+*.png
+*.jpg
+*.jpeg
+
+congresso/

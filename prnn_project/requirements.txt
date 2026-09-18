@@ -1,0 +1,36 @@
+# ==========================================
+# Core Scientific & Machine Learning
+# ==========================================
+numpy==2.5.0
+pandas==3.0.1
+scipy==1.18.0
+scikit-learn==1.9.0
+sympy==1.13.1
+
+# ==========================================
+# PyTorch Ecosystem
+# ==========================================
+torch==2.5.1+cu121
+torchaudio==2.5.1+cu121
+torchvision==0.20.1+cu121
+
+# ==========================================
+# Plotting & Visualization
+# ==========================================
+matplotlib==3.10.8
+h5py==3.16.0
+
+# ==========================================
+# Computational Mechanics & Meshing 
+# ==========================================
+gmsh==4.15.1
+meshio==5.1.2
+pyvista==0.47.1
+vtk==9.6.0
+-e /home/viny/Documentos/workspace/JiveApps/PVPlotter
+
+# ==========================================
+# Prototyping Environment
+# ==========================================
+jupyterlab==4.5.9
+notebook==7.5.7

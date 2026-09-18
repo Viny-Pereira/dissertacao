@@ -1,7 +1,11 @@
-gmsh>=4.15
+torch>=2.5.1
+numpy>=2.0.0
+pandas>=3.0.1
+scipy>=1.18.0
+matplotlib>=3.10.8
+gmsh>=4.15.1
 gmshModel>=1.1
-numpy==1.26.4
-meshio>=5.1
-pyvista>=0.46
-matplotlib>=3.10
+meshio>=5.1.2
+pyvista>=0.47.1
+PySide6>=6.11.0
 lmcv_tools
