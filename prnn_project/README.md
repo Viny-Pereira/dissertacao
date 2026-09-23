@@ -28,4 +28,7 @@ prnn_project/
 git clone [https://github.com/your-username/prnn_project.git](https://github.com/your-username/prnn_project.git)
 cd prnn_project
 pip install -r requirements.txt
+pip install -e .
 """
+
+
