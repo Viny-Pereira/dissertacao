@@ -20,21 +20,22 @@ def main() -> None:
     # -------------------------------------------------------------------------
     input_size = 6
     output_size = 6
-    num_material_points = 5
+    num_material_points = 1
     tensor_components = 6
     
     sequence_length = 61
     batch_size = 10
-    epochs = 1000
+    epochs = 100000
     learning_rate = 1e-3
-    patience = 50
+    patience = 1000
     random_seed = 42
+    dtype = torch.float64
 
     # Reproducibility
     np.random.seed(random_seed)
     random.seed(random_seed)
     torch.manual_seed(random_seed)
-    torch.set_default_dtype(torch.float64)
+    torch.set_default_dtype(dtype)
 
     # Device configuration (Force CPU or switch to CUDA if available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,9 +43,10 @@ def main() -> None:
 
     # Paths
     data_path = "data/monotonic_loading.out"  # Update with your actual data file path
-    weight_path = "trained_models/prnn_composite_loading_5_sparse.pth"
-    csv_path = "trained_models/historico_5_sparse.csv"
-
+    weight_path = "trained_models/prnn_composite_loading_5_dense.pth"
+    csv_path = "trained_models/historico_5_dense.csv"
+    batch_size_train = 3
+    batch_size_val = 10
     # -------------------------------------------------------------------------
     # 2. Dataset and Dataloader Setup
     # -------------------------------------------------------------------------
@@ -62,20 +64,25 @@ def main() -> None:
         normalize_features=True
     )
 
+    """
     # Split into training and validation sets (e.g., 80% train, 20% val)
     total_samples = len(full_dataset)
     train_size = int(0.8 * total_samples)
     val_size = total_samples - train_size
-
     train_dataset, val_dataset = torch.utils.data.random_split(
         full_dataset, [train_size, val_size],
         generator=torch.Generator().manual_seed(random_seed)
     )
+    """
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_dataset = torch.utils.data.Subset(full_dataset, range(30))
+    val_dataset = torch.utils.data.Subset(full_dataset, range(30, len(full_dataset)))
+    
 
-    print(f"Total sequences: {total_samples} | Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size_val, shuffle=False)
+
+    #print(f"Total sequences: {total_samples} | Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     # -------------------------------------------------------------------------
     # 3. Model Architecture Instantiation
@@ -92,11 +99,11 @@ def main() -> None:
         num_material_points=num_material_points,
         tensor_components=tensor_components,
         material_instance=material_model,
-        decoder_type='sparse'
+        decoder_type='soft'
     )
 
     # Wrap the cell into the sequence unroller
-    prnn_model = PRNNSequence(cell=cell).to(device)
+    prnn_model = PRNNSequence(cell=cell).to(device=device, dtype=dtype)
 
     # -------------------------------------------------------------------------
     # 4. Training Execution

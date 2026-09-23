@@ -18,7 +18,7 @@ class PRNNCell(nn.Module):
 
     def __init__(self, input_size: int, output_size: int, num_material_points: int, 
                  tensor_components: int, material_instance: Material, 
-                 decoder_type: str = 'sparse_normalized'):
+                 decoder_type: str = 'soft', dtype: torch.dtype=torch.float64):
         super().__init__()
         
         self.input_size = input_size
@@ -26,6 +26,7 @@ class PRNNCell(nn.Module):
         self.num_material_points = num_material_points
         self.tensor_components = tensor_components
         self.latent_size = self.num_material_points * self.tensor_components
+        self.dtype = dtype
         
         # 1. Physics: The Material Model
         self.material = material_instance
@@ -34,7 +35,9 @@ class PRNNCell(nn.Module):
         # Maps macro-strain to latent micro-strains
         self.encoder = nn.Linear(in_features=self.input_size, 
                                  out_features=self.latent_size, 
-                                 bias=False)
+                                 bias=False,
+                                 device=material_instance.device,
+                                 dtype=self.dtype)
         
         # 3. Decoder (Homogenization)
         # Calls the Factory to instantiate the requested topology automatically
@@ -42,7 +45,9 @@ class PRNNCell(nn.Module):
             layer_type=decoder_type,
             in_features=self.latent_size,
             out_features=self.output_size,
-            bias=False
+            bias=False,
+            device=material_instance.device,       
+            dtype=self.dtype
         )
 
     def forward(self, macro_strain_step: torch.Tensor) -> torch.Tensor:
@@ -63,7 +68,9 @@ class PRNNCell(nn.Module):
         
         # 2. Physics / Constitutive Evaluation
         micro_strain_reshaped = micro_strain_flat.view(total_points, self.tensor_components)
-        micro_stress_reshaped, _ = self.material.update(micro_strain_reshaped)
+        raw_stress, _ = self.material.update(micro_strain_reshaped)
+        micro_stress_reshaped = raw_stress.to(dtype=self.dtype)
+        
         self.material.commit()
         
         # 3. Homogenization

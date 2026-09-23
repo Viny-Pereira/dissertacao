@@ -38,13 +38,13 @@ class StressStrainDataset(Dataset):
     """
     def __init__(self, filename: str, features: List[int], targets: List[int], 
                  seq_length: int, normalize_features: bool = False, 
-                 normalizer: Optional[Normalizer] = None):
+                 normalizer: Optional[Normalizer] = None, dtype: torch.dtype = torch.float64):
         
         df = pd.read_csv(filename, sep=r"\s+", header=None)
         self.seq_length = seq_length
 
-        self.X = torch.tensor(df[features].values, dtype=torch.float32)
-        self.T = torch.tensor(df[targets].values, dtype=torch.float32)
+        self.X = torch.tensor(df[features].values, dtype=dtype)
+        self.T = torch.tensor(df[targets].values, dtype=dtype)
 
         self.normalize_features = normalize_features
 
@@ -154,12 +154,14 @@ class Trainer:
             verbose (bool, optional): If True, prints loss progression and early stopping 
                 messages to the console. Defaults to True.
         """
-        self._model.train() # Inicia o modo de treino do nn.Module
+        self._model.train()
         stall_iters = 0
         torch.autograd.set_detect_anomaly(False)
 
         for i in range(epochs):
-            running_loss = 0.0
+            # Acumuladores ponderados para treino
+            running_loss_total = 0.0
+            total_train_samples = 0
 
             # Domain-driven names: inputs (strain_seq) and targets (stress_seq)
             for inputs, targets in training_loader:
@@ -170,40 +172,50 @@ class Trainer:
                 predictions = self._model(inputs)
                 loss = self._criterion(predictions, targets)
                 
-                self._optimizer.zero_grad(set_to_none=True)  # Mais rápido que apenas zero_grad()
+                self._optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 
                 # Aggressive gradient clipping to prevent exploding gradients in PRNN unrolling
                 nn.utils.clip_grad_norm_(self._model.parameters(), max_norm=0.1)
                 
                 self._optimizer.step()
-                running_loss += loss.item()
+                
+                current_batch_size = inputs.size(0)
+                running_loss_total += loss.item() * current_batch_size
+                total_train_samples += current_batch_size
 
-            running_loss /= len(training_loader)
+            epoch_train_loss = running_loss_total / total_train_samples
             self._epoch += 1
 
             if i < interval or i % interval == 0:
                 with torch.no_grad():
                     self._model.eval()
-                    running_loss_val = 0.0
+                    running_val_loss_total = 0.0
+                    total_val_samples = 0
+                    
                     for x, t in validation_loader:
+                        x = x.to(self.device, non_blocking=True)
+                        t = t.to(self.device, non_blocking=True)
                         y = self._model(x)
                         loss = self._criterion(y, t)
-                        running_loss_val += loss.item()
                         
-                    running_loss_val /= len(validation_loader)
+                        current_batch_size = x.size(0)
+                        running_val_loss_total += loss.item() * current_batch_size
+                        total_val_samples += current_batch_size
+                        
+                    epoch_val_loss = running_val_loss_total / total_val_samples
                     
-                    self.train_losses.append(running_loss)
-                    self.val_losses.append(running_loss_val)
+                    self.train_losses.append(epoch_train_loss)
+                    self.val_losses.append(epoch_val_loss)
                     self._model.train()
 
                 if verbose:
-                    print(f"Epoch {self._epoch} | Training Loss: {running_loss:.6e} | Validation Loss: {running_loss_val:.6e}")
+                    print(f"Epoch {self._epoch} | Training Loss: {epoch_train_loss:.6e} | Validation Loss: {epoch_val_loss:.6e}")
 
-                if running_loss_val <= self._best_val:
-                    self._best_val = running_loss_val
+                if epoch_val_loss <= self._best_val:
+                    self._best_val = epoch_val_loss
                     self._best_state_dict = copy.deepcopy(self._model.state_dict())
-                    stall_iters = 0 # Its is usefull to break, compare to patiente
+                    stall_iters = 0
 
                     if verbose:
                         print("The best historical model has been updated. Resetting early stop counter.")
@@ -229,12 +241,12 @@ class Trainer:
             for j, (inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
-                # AS LINHAS QUE FALTAVAM:
                 # 1. A rede faz a previsão
                 predicted_stress = self._model(inputs)
                 
                 # 2. O critério (MSE ou RelativeError) calcula o quão errado foi
                 loss = self._criterion(predicted_stress, targets)
+                combined_loss += loss.item()
 
                 f"Loss for test batch {j+1}/{len(test_loader)}: {loss.item():.6e}"
 

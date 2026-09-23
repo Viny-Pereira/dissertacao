@@ -48,6 +48,8 @@ class SoftLayer(Homogenizer):
                  device: torch.device = None, dtype: torch.dtype = None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
+        if dtype is None:
+            dtype = torch.float64
 
         self.in_features = in_features
         self.out_features = out_features
@@ -101,6 +103,8 @@ class SparseNormalizedLayer(Homogenizer):
                  device: torch.device = None, dtype: torch.dtype = None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
+        if dtype is None:
+            dtype = torch.float64
 
         self.out_features = out_features
         self.num_subgroups = in_features // out_features
@@ -154,6 +158,8 @@ class HyperLayer(Homogenizer):
                  device: torch.device = None, dtype: torch.dtype = None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
+        if dtype is None:
+            dtype = torch.float64
 
         self.out_features = out_features
         self.num_subgroups = in_features // out_features
@@ -199,6 +205,8 @@ class AbsNormalizedLayer(Homogenizer):
                  device: torch.device = None, dtype: torch.dtype = None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
+        if dtype is None:
+            dtype = torch.float64
 
         self.in_features = in_features
         self.out_features = out_features

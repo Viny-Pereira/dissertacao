@@ -6,6 +6,181 @@ Includes both vectorized and looped implementations for performance benchmarking
 import time
 import torch
 from .interfaces import Material
+from typing import List, Tuple, Optional
+
+
+class CompositeMaterial(Material):
+    """
+    Composite material manager that orchestrates multiple constitutive models in parallel.
+    Partitions input strain tensors across different material phases and aggregates 
+    resulting stresses and algorithmic tangent moduli.
+    """
+    def __init__(self, materials_with_counts: List[Tuple[Material, int]]):
+        """
+        Args:
+            materials_with_counts: List of tuples containing material instances and their 
+                                   respective material point count.
+                                   Example: [(Elastic3DVectorized(), 3), (J2Material3DVectorized(), 2)]
+        """
+        super().__init__()
+        self.materials_with_counts = materials_with_counts
+        self.materials = [m for m, _ in materials_with_counts]
+        self.counts = [c for _, c in materials_with_counts]
+        self.total_points_per_sample = sum(self.counts)
+        self.batch_size = 0
+        self.tensor_components = 6
+
+        if self.total_points_per_sample <= 0:
+            raise ValueError("The total number of material points per sample must be strictly positive.")
+
+    def configure(self, total_points: int, tensor_components: int = 6) -> None:
+        """
+        Allocates memory and configures state variables for each sub-material 
+        based on the global batch size.
+
+        Args:
+            total_points (int): Flattened number of integration points (batch_size * total_points_per_sample).
+            tensor_components (int, optional): Voigt stress/strain tensor dimension. Defaults to 6.
+        """
+        if total_points % self.total_points_per_sample != 0:
+            raise ValueError(
+                f"total_points ({total_points}) must be a multiple of "
+                f"points per sample ({self.total_points_per_sample})."
+            )
+
+        self.batch_size = total_points // self.total_points_per_sample
+        self.tensor_components = tensor_components
+
+        for material, count in self.materials_with_counts:
+            sub_total_points = self.batch_size * count
+            material.configure(total_points=sub_total_points, tensor_components=tensor_components)
+
+    def update(self, micro_strain: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Partitions the flattened micro-strain tensor across sub-materials, evaluates 
+        their individual constitutive laws, and recombines the results.
+
+        Args:
+            micro_strain (torch.Tensor): Micro-strain tensor of shape 
+                                         [batch_size * total_points_per_sample, tensor_components].
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 
+                - Combined micro-stress tensor [batch_size * total_points_per_sample, tensor_components].
+                - Combined algorithmic tangent matrix [batch_size * total_points_per_sample, 6, 6].
+        """
+        strain_reshaped = micro_strain.view(self.batch_size, self.total_points_per_sample, self.tensor_components)
+
+        stress_blocks = []
+        tangent_blocks = []
+        start_idx = 0
+
+        for material, count in self.materials_with_counts:
+            end_idx = start_idx + count
+            
+            # Slice strain for this specific material phase
+            sub_strain = strain_reshaped[:, start_idx:end_idx, :].reshape(-1, self.tensor_components)
+            sub_stress, sub_tangent = material.update(sub_strain)
+            
+            stress_blocks.append(sub_stress.view(self.batch_size, count, self.tensor_components))
+            tangent_blocks.append(sub_tangent.view(self.batch_size, count, self.tensor_components, self.tensor_components))
+            
+            start_idx = end_idx
+
+        # Recombine across all material points
+        macro_stress_combined = torch.cat(stress_blocks, dim=1).view(-1, self.tensor_components)
+        macro_tangent_combined = torch.cat(tangent_blocks, dim=1).view(
+            -1, self.tensor_components, self.tensor_components
+        )
+
+        return macro_stress_combined, macro_tangent_combined
+
+    def commit(self) -> None:
+        """Propagates state commitment to all managed sub-materials upon step convergence."""
+        for material in self.materials:
+            material.commit()
+
+    def get_history(self) -> torch.Tensor:
+        """
+        Collects, unifies, and concatenates internal state variables from each sub-material.
+
+        Returns:
+            torch.Tensor: Aggregated history tensor of shape [batch_size * total_points_per_sample, history_dim].
+        """
+        histories = []
+        for material, count in self.materials_with_counts:
+            h = material.get_history()
+            # Ensure consistent 2D shape [batch_size * count, history_dim]
+            if h.ndim == 1:
+                h = h.unsqueeze(1)
+            histories.append(h.view(self.batch_size, count, -1))
+        
+        return torch.cat(histories, dim=1).view(-1, histories[0].size(-1))
+
+
+class Elastic3DVectorized(Material):
+    """
+    Linear isotropic elastic material model (Hooke's Law) in Voigt notation.
+    Evaluates stress states without requiring iterative plastic corrections.
+    """
+    def __init__(self, young_modulus: float = 70e3, poisson_ratio: float = 0.3, 
+                 device: Optional[torch.device] = None, dtype: torch.dtype = torch.float64):
+        super().__init__()
+        self.device = device if device is not None else torch.device("cpu")
+        self.dtype = dtype
+
+        self.young_modulus = young_modulus
+        self.poisson_ratio = poisson_ratio
+        self.bulk = young_modulus / (3.0 * (1.0 - 2.0 * poisson_ratio))
+        self.shear = young_modulus / (2.0 * (1.0 + poisson_ratio))
+
+        self.total_points = 0
+        self.tensor_components = 6
+        self.elastic_batch = torch.empty(0, device=self.device, dtype=self.dtype)
+
+    def configure(self, total_points: int, tensor_components: int = 6) -> None:
+        """
+        Pre-computes and expands the isotropic 3D elasticity matrix for the batch.
+
+        Args:
+            total_points (int): Number of integration points for this material phase.
+            tensor_components (int, optional): Voigt stress/strain dimensions. Defaults to 6.
+        """
+        self.total_points = total_points
+        self.tensor_components = tensor_components
+        
+        i_voigt = torch.tensor([1., 1., 1., 0., 0., 0.], device=self.device, dtype=self.dtype)
+        i_vol = torch.outer(i_voigt, i_voigt)
+        i_sym = torch.diag(torch.tensor([1., 1., 1., 0.5, 0.5, 0.5], device=self.device, dtype=self.dtype))
+        i_dev = i_sym - (1.0 / 3.0) * i_vol
+        
+        d_elastic = self.bulk * i_vol + 2.0 * self.shear * i_dev
+        self.elastic_batch = d_elastic.unsqueeze(0).repeat(total_points, 1, 1)
+
+    def update(self, micro_strain: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Computes elastic stress via direct tensor contraction (sigma = D : epsilon).
+
+        Args:
+            micro_strain (torch.Tensor): Micro-strain tensor of shape [total_points, tensor_components].
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 
+                - Stress tensor [total_points, tensor_components].
+                - Elastic stiffness matrix [total_points, 6, 6].
+        """
+        stress = torch.bmm(self.elastic_batch, micro_strain.unsqueeze(2)).squeeze(2)
+        return stress, self.elastic_batch
+
+    def commit(self) -> None:
+        """No internal state variables to commit in pure linear elasticity."""
+        pass
+
+    def get_history(self) -> torch.Tensor:
+        """
+        Returns a zero-valued scalar tensor since linear elasticity is history-independent.
+        """
+        return torch.zeros((self.total_points, 1), device=self.device, dtype=self.dtype)
 
 
 class J2Material3DVectorized(Material):
@@ -14,7 +189,8 @@ class J2Material3DVectorized(Material):
     Processes the entire batch of material points simultaneously using tensor operations.
     """
     def __init__(self, device: torch.device):
-        super().__init__(device)
+        super().__init__()
+        self.device = device
 
         # Elastic properties
         self.young_modulus = 79.5e3
