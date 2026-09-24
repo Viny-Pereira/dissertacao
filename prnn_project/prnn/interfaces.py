@@ -81,7 +81,22 @@ class PRNN(nn.Module, ABC):
         pass
 
 
-class Homogenizer(nn.Module, ABC):
+class Encoder(nn.Module, ABC):
+    """
+    Abstract interface for kinematic de-homogenization layers (macro -> micro strain).
+    """
+    @abstractmethod
+    def forward(self, macro_strain: torch.Tensor) -> torch.Tensor:
+        """
+        Maps macroscopic strain to flattened microscopic strain fields.
+        Args:
+            macro_strain (torch.Tensor): Shape [batch_size, input_dim].
+        Returns:
+            torch.Tensor: Flattened micro-strains [batch_size, num_points * tensor_components].
+        """
+        pass
+
+class Decoder(nn.Module, ABC):
     """
     Abstract base class for all multiscale homogenization layers (Decoders).
     Ensures that any implemented layer adheres to physical constraints and topological rules.

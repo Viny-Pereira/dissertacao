@@ -7,40 +7,84 @@ for micro-to-macro stress integration.
 """
 
 import math
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .interfaces import Homogenizer
+from .interfaces import Decoder, Encoder
 
-
-class HomogenizerFactory:
+class LinearEncoder(Encoder):
     """
-    Factory to instantiate homogenization layers based on a configuration string.
+    Unconstrained linear de-homogenization layer.
+    """
+    def __init__(self, in_features: int, out_features: int, 
+                 device: Optional[torch.device] = None, dtype: torch.dtype = torch.float64):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=False, device=device, dtype=dtype)
+
+    def forward(self, macro_strain: torch.Tensor) -> torch.Tensor:
+        return self.linear(macro_strain)
+
+
+class ConsistentEncoder(Encoder):
+    """
+    Kinematically consistent de-homogenization layer enforcing strict partition 
+    of unity: sum_k(w_k * A_k) = Identity, ruling out unphysical volumetric modes.
+    """
+    def __init__(self, num_material_points: int, tensor_components: int = 6,
+                 device: Optional[torch.device] = None, dtype: torch.dtype = torch.float64):
+        super().__init__()
+        self.num_points = num_material_points
+        self.dim = tensor_components
+        self.device = device or torch.device("cpu")
+        self.dtype = dtype
+
+        # Unconstrained learnable perturbation around identity
+        self.raw_weights = nn.Parameter(
+            torch.zeros((self.num_points, self.dim, self.dim), device=self.device, dtype=self.dtype)
+        )
+        nn.init.normal_(self.raw_weights, mean=0.0, std=1e-3)
+
+        self.register_buffer(
+            "identity", 
+            torch.eye(self.dim, device=self.device, dtype=self.dtype).unsqueeze(0).repeat(self.num_points, 1, 1)
+        )
+
+    def forward(self, macro_strain: torch.Tensor) -> torch.Tensor:
+        batch_size = macro_strain.size(0)
+        
+        # Enforce zero-mean perturbation across material points
+        perturbation_mean = torch.mean(self.raw_weights, dim=0, keepdim=True)
+        zero_mean_perturbation = self.raw_weights - perturbation_mean
+        localization_tensors = self.identity + zero_mean_perturbation  # [Np, 6, 6]
+
+        macro_expanded = macro_strain.unsqueeze(1).unsqueeze(-1)         # [batch, 1, 6, 1]
+        a_expanded = localization_tensors.unsqueeze(0)                   # [1, Np, 6, 6]
+        
+        micro_strain = torch.matmul(a_expanded, macro_expanded).squeeze(-1) # [batch, Np, 6]
+        return micro_strain.view(batch_size, self.num_points * self.dim)
+
+class EncoderFactory:
+    """
+    Factory to instantiate kinematic de-homogenization layers via class registry.
     """
     _registry = {
-        "soft": lambda **k: SoftLayer(**k),
-        "sparse_normalized": lambda **k: SparseNormalizedLayer(**k),
-        "hyper": lambda **k: HyperLayer(**k),
-        "abs_normalized": lambda **k: AbsNormalizedLayer(**k)
+        "linear": LinearEncoder,
+        "consistent": ConsistentEncoder,
+        "kinematic": ConsistentEncoder
     }
 
     @classmethod
-    def create(cls, layer_type: str, in_features: int, out_features: int, **kwargs) -> Homogenizer:
-        """
-        Instantiates and returns the requested homogenization layer.
-        """
-        layer_constructor = cls._registry.get(layer_type.lower())
-        
-        if layer_constructor is None:
-            raise ValueError(f"Homogenizer '{layer_type}' not found. "
-                             f"Available options: {list(cls._registry.keys())}")
-            
-        return layer_constructor(in_features=in_features, out_features=out_features, **kwargs)
+    def create(cls, encoder_type: str, num_points: int, tensor_components: int = 6, **kwargs) -> Encoder:
+        constructor = cls._registry.get(encoder_type.lower())
+        if constructor is None:
+            raise ValueError(f"Encoder '{encoder_type}' not found. Available: {list(cls._registry.keys())}")
+        return constructor(num_material_points=num_points, tensor_components=tensor_components, **kwargs)
 
 
-class SoftLayer(Homogenizer):
+class SoftLayer(Decoder):
     """
     Fully connected layer with strictly positive weights enforced via Softplus.
     """
@@ -93,7 +137,7 @@ class SoftLayer(Homogenizer):
         return output, weighted_values
 
 
-class SparseNormalizedLayer(Homogenizer):
+class SparseNormalizedLayer(Decoder):
     """
     Sparse homogenization layer. Restricts cross-connections by linking each 
     macroscopic stress component strictly to its corresponding microscopic components.
@@ -149,7 +193,7 @@ class SparseNormalizedLayer(Homogenizer):
         return output, weighted_values.view(-1)
 
 
-class HyperLayer(Homogenizer):
+class HyperLayer(Decoder):
     """
     Assigns a single scalar weight to all stress components of a given material point.
     Weights are normalized across all material points to sum to 1.
@@ -196,7 +240,7 @@ class HyperLayer(Homogenizer):
         return output, weighted_values.view(-1)
 
 
-class AbsNormalizedLayer(Homogenizer):
+class AbsNormalizedLayer(Decoder):
     """
     Fully connected layer where weights are enforced as absolute values 
     and normalized by row (dim=1) so that the contributions to each output sum to 1.
@@ -244,3 +288,28 @@ class AbsNormalizedLayer(Homogenizer):
             output += self.bias
             
         return output, weighted_values
+
+class DecoderFactory:
+    """
+    Factory to instantiate homogenization layers based on a configuration string.
+    """
+    _registry = {
+        "soft": SoftLayer(),
+        "sparse_normalized":SparseNormalizedLayer(),
+        "hyper":HyperLayer(),
+        "abs_normalized":AbsNormalizedLayer()
+    }
+
+    @classmethod
+    def create(cls, layer_type: str, in_features: int, out_features: int, **kwargs) -> Decoder:
+        """
+        Instantiates and returns the requested homogenization layer.
+        """
+        layer_constructor = cls._registry.get(layer_type.lower())
+        
+        if layer_constructor is None:
+            raise ValueError(f"Homogenizer '{layer_type}' not found. "
+                             f"Available options: {list(cls._registry.keys())}")
+            
+        return layer_constructor(in_features=in_features, out_features=out_features, **kwargs)
+

@@ -5,8 +5,8 @@ Separates the single-step physics (Cell) from the temporal unrolling (Sequence).
 
 import torch
 import torch.nn as nn
-from .interfaces import Material, PRNN, Homogenizer
-from .layers import HomogenizerFactory
+from .interfaces import Material, PRNN, Decoder
+from .layers import DecoderFactory
 
 
 class PRNNCell(nn.Module):
@@ -41,7 +41,7 @@ class PRNNCell(nn.Module):
         
         # 3. Decoder (Homogenization)
         # Calls the Factory to instantiate the requested topology automatically
-        self.decoder: Homogenizer = HomogenizerFactory.create(
+        self.decoder: Decoder = DecoderFactory.create(
             layer_type=decoder_type,
             in_features=self.latent_size,
             out_features=self.output_size,
