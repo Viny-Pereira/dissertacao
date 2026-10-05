@@ -9,11 +9,16 @@ import copy
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
-from typing import Optional, List, Tuple
+from typing import Any, Optional, List, Tuple
+
+from .models import PRNNCell
 
 
 class Normalizer:
@@ -116,13 +121,13 @@ class Trainer:
     Early stopping is implemented with adjustable patience.
     """
     def __init__(self, model: nn.Module, optimizer: Optional[torch.optim.Optimizer] = None, 
-                 loss: Optional[nn.Module] = None):
+                 loss: Optional[nn.Module] = None, scheduler: Optional[Any] = None):
         self._model = model
         self._epoch = 0
         self._criterion = loss if loss else nn.MSELoss()
         self._optimizer = optimizer if optimizer else torch.optim.Adam(self._model.parameters())
         self.device = next(self._model.parameters()).device
-        
+        self.scheduler = scheduler
         self.train_losses: List[float] = []
         self.val_losses: List[float] = []
         
@@ -165,14 +170,13 @@ class Trainer:
 
             # Domain-driven names: inputs (strain_seq) and targets (stress_seq)
             for inputs, targets in training_loader:
-                # CRÍTICO: Move os tensores do Dataset para a mesma GPU do Modelo
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 
                 predictions = self._model(inputs)
                 loss = self._criterion(predictions, targets)
                 
-                self._optimizer.zero_grad(set_to_none=True)
+                self._optimizer.zero_grad(spet_to_none=True)
                 loss.backward()
                 
                 # Aggressive gradient clipping to prevent exploding gradients in PRNN unrolling
@@ -208,6 +212,12 @@ class Trainer:
                     self.train_losses.append(epoch_train_loss)
                     self.val_losses.append(epoch_val_loss)
                     self._model.train()
+                    
+                if self.scheduler is not None:
+                    if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        self.scheduler.step(epoch_val_loss)
+                    else:
+                        self.scheduler.step()
 
                 if verbose:
                     print(f"Epoch {self._epoch} | Training Loss: {epoch_train_loss:.6e} | Validation Loss: {epoch_val_loss:.6e}")
@@ -229,33 +239,61 @@ class Trainer:
 
         print("End of training.")
 
-    def eval(self, test_loader: torch.utils.data.DataLoader, verbose: bool = True) -> float:
-        """Evaluates the model on a test set using the best historical weights."""
+    def eval(self, test_loader: torch.utils.data.DataLoader, verbose: bool = True) -> Tuple[float, float, torch.Tensor, torch.Tensor]:
+        """
+        Evaluates the model on a test/validation loader using the best historical weights.
+        
+        Returns:
+            Tuple[float, float, torch.Tensor, torch.Tensor]:
+                - mse_loss: Mean Squared Error across all sequences.
+                - rmse_loss: Root Mean Squared Error (in MPa).
+                - all_predictions: Concatenated predicted stresses [N_samples, seq_len, 6].
+                - all_targets: Concatenated ground-truth stresses [N_samples, seq_len, 6].
+        """
+        # Restaura temporariamente os melhores pesos salvos durante o treino
+        
         live_state = copy.deepcopy(self._model.state_dict())
         self._model.load_state_dict(self._best_state_dict)
-
-        combined_loss = 0.0
         self._model.eval()
-        
+
+        running_loss_total = 0.0
+        total_samples = 0
+        predictions_list = []
+        targets_list = []
+
         with torch.no_grad():
-            for j, (inputs, targets) in enumerate(test_loader):
+            for inputs, targets in test_loader:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
-                # 1. A rede faz a previsão
+
                 predicted_stress = self._model(inputs)
-                
-                # 2. O critério (MSE ou RelativeError) calcula o quão errado foi
                 loss = self._criterion(predicted_stress, targets)
-                combined_loss += loss.item()
 
-                f"Loss for test batch {j+1}/{len(test_loader)}: {loss.item():.6e}"
+                current_batch_size = inputs.size(0)
+                running_loss_total += loss.item() * current_batch_size
+                total_samples += current_batch_size
 
-        avg_loss = combined_loss / len(test_loader)
-        if verbose:
-            print(f"Aggregated test set loss: {avg_loss:.6e}")
+                predictions_list.append(predicted_stress.detach().cpu())
+                targets_list.append(targets.detach().cpu())
 
+        # Restaura o estado original de treino
         self._model.load_state_dict(live_state)
-        return avg_loss
+        self._model.train()
+
+        mse_loss = running_loss_total / total_samples
+        rmse_loss = np.sqrt(mse_loss)
+        all_predictions = torch.cat(predictions_list, dim=0)
+        all_targets = torch.cat(targets_list, dim=0)
+
+        if verbose:
+            print(f"\n{'='*50}")
+            print(f"EVALUATION RESULTS (Best Model Checkpoint):")
+            print(f"  Total Sequences Evaluated : {total_samples}")
+            print(f"  Aggregated MSE            : {mse_loss:.6e} MPa²")
+            print(f"  Aggregated RMSE           : {rmse_loss:.4f} MPa")
+            print(f"{'='*50}\n")
+
+        return mse_loss, rmse_loss, all_predictions, all_targets
 
     def save(self, filename: str) -> None:
         """Saves the best model state and optimizer states to a file."""
@@ -286,11 +324,7 @@ def train_and_save_model(model: nn.Module, train_loader: torch.utils.data.DataLo
                          val_loader: torch.utils.data.DataLoader, 
                          weight_path: str, csv_path: str, 
                          lr: float = 1e-3, epochs: int = 100000, 
-                         patience: int = 1000) -> Tuple[float, int]:
-    """
-    Instantiates the optimizer, runs training, times the execution, 
-    saves network weights, and exports convergence history with metadata.
-    """
+                         patience: int = 1000) -> Tuple[Trainer, float, int]:
     print(f"Starting training... Destination for weights: {weight_path}")
     print(f"Hyperparameters: LR={lr}, Epochs={epochs}, Patience={patience}")
     
@@ -309,9 +343,7 @@ def train_and_save_model(model: nn.Module, train_loader: torch.utils.data.DataLo
 
     trainer.save(weight_path)
 
-    # Prepare and save CSV with structured metadata
     history_data = np.column_stack((trainer.train_losses, trainer.val_losses))
-    
     header = (
         f"Hyperparameters - LR: {lr} | Patience: {patience} | Max Epochs: {epochs}\n"
         f"Total_Time_sec: {total_time_sec:.4f}\n"
@@ -319,13 +351,12 @@ def train_and_save_model(model: nn.Module, train_loader: torch.utils.data.DataLo
         f"Time_per_epoch_sec: {time_per_epoch_sec:.6f}\n"
         f"Train_Loss,Val_Loss"
     )
-
     np.savetxt(csv_path, history_data, delimiter=",", header=header, comments="# ")
 
     print(f"[OK] Training completed in {total_time_sec:.2f} s ({epochs_run} epochs).")
     print(f"[OK] Data saved to: {csv_path}\n")
     
-    return total_time_sec, epochs_run
+    return trainer, total_time_sec, epochs_run
 
 
 def plot_convergence_from_csv(csv_path: str, ignore_initial: int = 100) -> None:
@@ -373,3 +404,92 @@ def plot_convergence_from_csv(csv_path: str, ignore_initial: int = 100) -> None:
 
     plt.tight_layout()
     plt.show()
+
+
+def plot_stress_strain_comparison(strain_seq: np.ndarray, stress_true: np.ndarray, 
+                                  stress_pred: np.ndarray, sample_idx: int = 0, 
+                                  component: int = 0) -> None:
+    """
+    Plota a curva de tensão x deformação comparando o RVE original com a PRNN.
+    component: 0 -> 11, 1 -> 22, 2 -> 33, 3 -> 12, 4 -> 23, 5 -> 13
+    """
+    comp_names = [r"\sigma_{11}", r"\sigma_{22}", r"\sigma_{33}", r"\tau_{12}", r"\tau_{23}", r"\tau_{13}"]
+    strain_names = [r"\varepsilon_{11}", r"\varepsilon_{22}", r"\varepsilon_{33}", r"\gamma_{12}", r"\gamma_{23}", r"\gamma_{13}"]
+
+    eps = strain_seq[sample_idx, :, component]
+    sig_true = stress_true[sample_idx, :, component]
+    sig_pred = stress_pred[sample_idx, :, component]
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(eps, sig_true, 'k-', linewidth=2.0, label='Ground Truth (RVE/Abaqus)')
+    plt.plot(eps, sig_pred, 'r--', linewidth=2.0, label='PRNN Prediction')
+
+    plt.xlabel(f"${strain_names[component]}$")
+    plt.ylabel(f"${comp_names[component]}$ [MPa]")
+    plt.title(f"Response Comparison - Trajectory {sample_idx}")
+    plt.grid(True, ls="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+
+def inspect_human_readable_weights(cell: Any, num_points: int) -> None:
+    """
+    Imprime as matrizes de pesos do Encoder (A_ij) e Decoder (W_ij)
+    usando indexação matricial formal 6x6 por ponto material.
+    """
+    col_indices = [f"Col {j}" for j in range(1, 7)]
+
+    print("\n" + "=" * 78)
+    print("MATRIZES DE PESOS TREINADOS DA PRNN (ÁLGEBRA LINEAR CONSTITUTIVA)")
+    print("=" * 78)
+
+    # 1. ENCODER: Matriz A^(k) [6 x 6]
+    enc_weight = getattr(cell.encoder, "weight", getattr(getattr(cell.encoder, "linear", None), "weight", None))
+    if enc_weight is None:
+        print("[Aviso] Camada linear do encoder não encontrada.")
+        return
+        
+    enc_np = enc_weight.detach().cpu().numpy()  # Formato: [Np * 6, 6]
+
+    print("\n[ENCODER] Matriz A^(k): eps_micro^(k) = A^(k) @ eps_macro")
+    for k in range(num_points):
+        print(f"\n>> Ponto Material k = {k + 1} | Matriz A^({k+1}) [6x6]:")
+        block = enc_np[k * 6 : (k + 1) * 6, :]
+        
+        # Cabeçalho: Colunas j = 1..6
+        header = "          " + " ".join([f"{c:>9}" for c in col_indices])
+        print(header)
+        print("-" * len(header))
+        
+        for i, row in enumerate(block):
+            row_str = " ".join([f"{val:9.4f}" for val in row])
+            # Linha i = 1..6 -> A_i1, A_i2, ...
+            print(f" Linha {i+1} | {row_str}")
+
+    # 2. DECODER: Matriz W^(k) [6 x 6]
+    dec_weight = getattr(cell.decoder, "weight", getattr(getattr(cell.decoder, "linear", None), "weight", None))
+    if dec_weight is None:
+        print("[Aviso] Camada linear do decoder não encontrada.")
+        return
+
+    # Ativação física Softplus para obter os pesos efetivos de homogeneização
+    eff_dec = F.softplus(dec_weight).detach().cpu().numpy()  # Formato: [6, Np * 6]
+
+    print("\n" + "-" * 78)
+    print("[DECODER] Matriz W^(k) = Softplus(pesos): sig_macro = sum_k W^(k) @ sig_micro^(k)")
+    for k in range(num_points):
+        print(f"\n>> Ponto Material k = {k + 1} | Matriz W^({k+1}) [6x6]:")
+        block = eff_dec[:, k * 6 : (k + 1) * 6]
+        
+        header = "          " + " ".join([f"{c:>9}" for c in col_indices])
+        print(header)
+        print("-" * len(header))
+        
+        for i, row in enumerate(block):
+            row_str = " ".join([f"{val:9.4f}" for val in row])
+            # Linha i = 1..6 -> W_i1, W_i2, ...
+            print(f" Linha {i+1} | {row_str}")
+
+    print("=" * 78 + "\n")

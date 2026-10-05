@@ -188,10 +188,10 @@ class J2Material3DVectorized(Material):
     Fully vectorized 3D J2 Plasticity model.
     Processes the entire batch of material points simultaneously using tensor operations.
     """
-    def __init__(self, device: torch.device):
+    def __init__(self, device: Optional[torch.device] = None, dtype: torch.dtype = torch.float64):
         super().__init__()
         self.device = device
-
+        self.dtype = dtype
         # Elastic properties
         self.young_modulus = 79.5e3
         self.poisson_ratio = 0.33

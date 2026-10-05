@@ -1,97 +1,251 @@
-import matplotlib.pyplot as plt
-import numpy as np
+import os
+import sys
+import copy
+from pathlib import Path
+from typing import Dict, List, Optional
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
 
-def aplicar_media_movel(dados, janela=50):
-    """Aplica média móvel simples (SMA)."""
-    if janela < 2:
-        return dados
-    return np.convolve(dados, np.ones(janela)/janela, mode='valid')
+# Garante acesso ao pacote prnn adicionando a raiz do projeto ao sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-def plot_comparacao_espectro(lista_pontos, tipo_erro='RMSE', sigma_y=500.0, suavizar=False, janela=50, topologia='sparse'):
+from prnn.materials import J2Material3DVectorized
+from prnn.models import PRNNCell, PRNNSequence
+from prnn.utils import (
+    StressStrainDataset,
+    Trainer,
+    RelativeError,
+    RobustRelativeError
+)
+from prnn.visualization import plot_publication_prnn
+class Evaluator:
     """
-    Plota a convergência comparando múltiplos números de pontos materiais.
+    Classe dedicada à avaliação de modelos PRNN treinados.
+    Executa inferências sem gradiente, computa métricas físicas e gera gráficos científicos.
     """
-    # Configuração global de fontes (Padrão artigo científico/dissertação)
-    plt.rcParams.update({
-        "font.family": "STIXGeneral",
-        "mathtext.fontset": "stix",
-        "font.size": 11,          
-        "axes.labelsize": 12,     
-        "xtick.labelsize": 10,    
-        "ytick.labelsize": 10,    
-        "legend.fontsize": 10
-    })
+    def __init__(
+        self,
+        weight_path: str,
+        num_material_points: int = 1,
+        decoder_type: str = "soft",
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float64,
+        num_threads: int = 4
+    ):
+        self.device = device or torch.device("cpu")
+        self.dtype = dtype
+        self.weight_path = weight_path
+        self.num_material_points = num_material_points
+        self.decoder_type = decoder_type
 
-    # Formato Widescreen (10 x 5.5) ideal para apresentações e relatórios
-    fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
+        if self.device.type == "cpu":
+            torch.set_num_threads(num_threads)
 
-    # Paletas de cores distintas para cada quantidade de pontos
-    paletas = [plt.cm.Blues, plt.cm.Oranges, plt.cm.Greens, plt.cm.Purples]
+        torch.set_default_dtype(self.dtype)
 
-    for i, pts in enumerate(lista_pontos):
-        # Mapeia dinamicamente o nome do arquivo conforme a topologia escolhida
-        sufixo = topologia.lower()
-        csv_path = f"trained_models/historico_{pts}_{sufixo}.csv"
-        
-        try:
-            dados = np.loadtxt(csv_path, delimiter=',', comments='#')
-            train_data = np.sqrt(dados[:, 0])
-            val_data = np.sqrt(dados[:, 1])
+        # 1. Instancia o Modelo Modular
+        material = J2Material3DVectorized(device=self.device, dtype=self.dtype)
+        cell = PRNNCell(
+            num_material_points=self.num_material_points,
+            material_instance=material,
+            dim=3,
+            decoder_type=self.decoder_type,
+            dtype=self.dtype
+        )
+        self.model = PRNNSequence(cell=cell).to(device=self.device, dtype=self.dtype)
+
+        # 2. CARREGAR OS PESOS PRIMEIRO!
+        self._load_weights()
+
+        # 3. Agora instancia o Trainer com o modelo já calibrado com os pesos certos
+        self.trainer = Trainer(self.model)
+        self.trainer._best_state_dict = copy.deepcopy(self.model.state_dict())
+        self.model.eval()
+
+    def _load_weights(self) -> None:
+        """Carrega os pesos compatibilizando modelos novos e legados com validação estrita."""
+        if not os.path.exists(self.weight_path):
+            raise FileNotFoundError(f"Arquivo de pesos não encontrado: {self.weight_path}")
+
+        checkpoint = torch.load(self.weight_path, map_location=self.device, weights_only=False)
+        state_dict = checkpoint.get("best_state_dict", checkpoint.get("model_state_dict", checkpoint))
+
+        model_keys = list(self.model.state_dict().keys())
+
+        if "fc1.weight" in state_dict:
+            print("[INFO] Detectado formato legado (fc1/fc2). Mapeando para o modelo modular...")
             
-            if tipo_erro == 'RELATIVO':
-                train_data = (train_data / sigma_y) * 100
-                val_data = (val_data / sigma_y) * 100
+            enc_key = "cell.encoder.linear.weight" if "cell.encoder.linear.weight" in model_keys else "cell.encoder.weight"
+            dec_key = "cell.decoder.weight"
             
-            paleta = paletas[i % len(paletas)]
+            mapped_state = {
+                enc_key: state_dict["fc1.weight"],
+                dec_key: state_dict["fc2.weight"]
+            }
             
-            if suavizar:
-                t_plot = aplicar_media_movel(train_data, janela)
-                v_plot = aplicar_media_movel(val_data, janela)
-                x_axis = np.arange(len(t_plot))
+            dec_bias_key = "cell.decoder.bias"
+            if dec_bias_key in model_keys:
+                if "fc2.bias" in state_dict and state_dict["fc2.bias"] is not None:
+                    mapped_state[dec_bias_key] = state_dict["fc2.bias"]
+                else:
+                    mapped_state[dec_bias_key] = torch.zeros_like(self.model.state_dict()[dec_bias_key])
+
+            # Carrega no modelo
+            self.model.load_state_dict(mapped_state, strict=False)
+            
+            # Verificação de Sanidade: confere se os valores do encoder batem com o checkpoint
+            diff = torch.max(torch.abs(self.model.cell.encoder.weight - state_dict["fc1.weight"])).item()
+            if diff > 1e-9:
+                raise RuntimeError("ERRO CRÍTICO: Os pesos do encoder continuam diferentes do checkpoint!")
+            print(f"[OK] Validação de integridade aprovada (Discrepância dos pesos: {diff:.2e})")
+
+        else:
+            self.model.load_state_dict(state_dict)
+
+        print(f"[OK] Pesos carregados e validados com sucesso a partir de: {self.weight_path}\n")
+
+    def evaluate_metrics(
+        self, 
+        data_loaders: Dict[str, DataLoader], 
+        criterion: Optional[nn.Module] = None,
+        verbose_batches: bool = True
+    ) -> Dict[str, float]:
+        """
+        Avalia os conjuntos de dados reproduzindo a saída por lote do código original.
+        """
+        # Se nenhum critério for especificado, utiliza MSELoss como no notebook
+        eval_criterion = criterion if criterion is not None else nn.MSELoss()
+        results = {}
+
+        print("\n" + "=" * 70)
+        print("INÍCIO DA AVALIAÇÃO DE TESTE / VALIDAÇÃO")
+        print("=" * 70)
+
+        with torch.no_grad():
+            for dataset_name, loader in data_loaders.items():
+                print(f"\n--- Avaliando: {dataset_name} ({len(loader)} lotes) ---")
                 
-                # Linhas mais grossas para destaque visual
-                ax.plot(x_axis, t_plot, color=paleta(0.8), linestyle='-', 
-                        linewidth=2.5, label=f'{pts} pts ({topologia.upper()}) - Train')
-                ax.plot(x_axis, v_plot, color=paleta(0.4), linestyle='--', 
-                        linewidth=2.5, label=f'{pts} pts ({topologia.upper()}) - Val')
-            else:
-                ax.plot(train_data, color=paleta(0.8), linestyle='-', 
-                        linewidth=1.5, alpha=0.6, label=f'{pts} pts ({topologia.upper()}) - Train')
-                ax.plot(val_data, color=paleta(0.4), linestyle='--', 
-                        linewidth=1.5, label=f'{pts} pts ({topologia.upper()}) - Val')
-            
-        except FileNotFoundError:
-            print(f"Aviso: Arquivo '{csv_path}' não encontrado. Verifique se o treino foi executado.")
+                combined_loss = 0.0
+                total_batches = len(loader)
 
-    # Configurações do Eixo e Escala Logarítmica
-    ax.set_yscale('log')
-    ax.set_xlabel("Epoch", fontweight='bold')
-    ax.set_ylabel("RMSE (MPa)" if tipo_erro == 'RMSE' else "Relative Error (%)", fontweight='bold')
-    
-    # ATENÇÃO: Em escala logarítmica, o limite inferior (ymin) DEVE ser estritamente maior que 0 (ex: 1e-2 ou 1e-1)
-    # Retiramos o limite '-5' para evitar o travamento do Matplotlib.
-    #ax.set_ylim(bottom=None, top=1000) 
-    
-    ax.set_title(f"Convergence Analysis: Multiscale Material Points ({topologia.upper()})", fontsize=14, pad=15, fontweight='bold')
-    ax.grid(True, which="both", ls=":", alpha=0.6)
-    
-    # Legenda organizada em colunas no topo
-    ax.legend(ncol=3, loc='upper right', frameon=True, edgecolor='black')
-    
-    # Salva a figura em alta resolução para a dissertação/slides
-    output_filename = f"trained_models/comparacao_convergencia_{topologia}.png"
-    plt.savefig(output_filename, dpi=300)
-    print(f"Gráfico comparativo salvo com sucesso em: {output_filename}")
-    
-    plt.show()
+                for j, (x, t) in enumerate(loader):
+                    x = x.to(self.device, non_blocking=True)
+                    t = t.to(self.device, non_blocking=True)
+                    
+                    y = self.model(x)
+                    loss = eval_criterion(y, t)
+                    loss_val = loss.item()
+                    combined_loss += loss_val
 
-# --- Exemplos de Uso ---
-if __name__ == "__main__":
-    # Exemplo comparando 1, 3 e 5 pontos com suavização (janela de 50 épocas)
-    plot_comparacao_espectro(
-        lista_pontos=[1, 3, 5], 
-        tipo_erro='RMSE', 
-        suavizar=True, 
-        janela=50, 
-        topologia='dense' # Pode trocar para 'dense' se preferir
+                    # Impressão exatamente idêntica ao notebook original
+                    if verbose_batches:
+                        print(f"Loss for test batch  {j + 1} / {total_batches} : {loss_val}")
+
+                avg_loss = combined_loss / total_batches
+                results[dataset_name] = avg_loss
+
+                print(f"Aggregated test set loss: {avg_loss}")
+                print(f"{avg_loss}\n")
+
+        print("=" * 70)
+        return results
+    
+    def plot_curves(
+        self,
+        dataset: StressStrainDataset,
+        curve_ids: List[int],
+        output_dir: str = "plots_eval",
+        dataset_label: str = "Micro FE"
+    ) -> None:
+        """
+        Extrai as trajetórias selecionadas e salva o painel de 6 componentes.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"\nGerando gráficos para as curvas {curve_ids}...")
+
+        with torch.no_grad():
+            for c_id in curve_ids:
+                if c_id >= len(dataset):
+                    print(f"Aviso: Curva {c_id} está fora dos limites do dataset.")
+                    continue
+
+                strain_tensor, true_stress_tensor = dataset[c_id]
+                strain_batch = strain_tensor.unsqueeze(0).to(self.device, dtype=self.dtype)
+
+                pred_stress_tensor = self.model(strain_batch)
+
+                hf_strain = strain_tensor.cpu().numpy()
+                hf_stress = true_stress_tensor.cpu().numpy()
+                nn_stress = pred_stress_tensor.squeeze(0).cpu().numpy()
+
+                save_path = os.path.join(output_dir, f"curva_{c_id}_painel_6comp.png")
+                plot_publication_prnn(
+                    hf_strain=hf_strain,
+                    hf_stress=hf_stress,
+                    nn_strain=hf_strain,
+                    nn_stress=nn_stress,
+                    curve_id=c_id,
+                    custom_labels=[dataset_label, f"PRNN ({self.num_material_points} pts)"],
+                    save_path=save_path,
+                    contexto="artigo",
+                    orientacao="horizontal"
+                )
+                print(f" -> Salvo: {save_path}")
+
+def main():
+    # -------------------------------------------------------------------------
+    # CONFIGURAÇÕES DA AVALIAÇÃO
+    # -------------------------------------------------------------------------
+    # Caminho do modelo a testar
+    #weight_file = "prnn/benchmark_comparison/prnn_composite_loading_1_dense.pth"
+    weight_file = "dissertacao/prnn_project/benchmark_points/prnn_pts1_soft.pth"
+    
+    #weight_file = "prnn/benchmark_comparison/prnn_modular_1pt_soft.pth"
+
+    num_points = 1
+    decoder_type = "soft"
+    
+    device = torch.device("cpu")
+    dtype = torch.float64
+
+    # 1. Instancia o Avaliador
+    evaluator = Evaluator(
+        weight_path=weight_file,
+        num_material_points=num_points,
+        decoder_type=decoder_type,
+        device=device,
+        dtype=dtype,
+        num_threads=4
     )
+
+    # 2. Definição do Dataset de Carregamento Monotônico
+    features = list(range(6))
+    targets = list(range(6, 12))
+    seq_len = 61
+
+    # Carrega o arquivo de carregamento monotônico
+    monotonic_ds = StressStrainDataset("data/monotonic_loading.out", features, targets, seq_len, dtype=dtype)
+    
+    # Separa a validação exatamente como no treino (curvas 30 em diante)
+    val_monotonic = Subset(monotonic_ds, range(30, len(monotonic_ds)))
+
+    test_loaders = {
+        "Monotonic Loading (Validação)": DataLoader(val_monotonic, batch_size=10, shuffle=False)
+    }
+
+    # 3. Execução das Métricas com L1Loss (Erro Absoluto Médio em MPa)
+    evaluator.evaluate_metrics(test_loaders, criterion=nn.MSELoss(), verbose_batches=True)
+
+    # 4. Geração dos Gráficos das Curvas no Próprio Monotonic Loading
+    # Exemplo: Curva 30 e Curva 50 (que pertencem ao conjunto de validação)
+    evaluator.plot_curves(
+        dataset=monotonic_ds,
+        curve_ids=[30, 50],
+        output_dir="plots_eval/monotonic",
+        dataset_label="Micro FE (Monotonic)"
+    )
+
+
+if __name__ == "__main__":
+    main()

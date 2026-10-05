@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 
-class Material(ABC):
+class Material(nn.Module, ABC):
     """
     Abstract base class for physical constitutive models.
     """

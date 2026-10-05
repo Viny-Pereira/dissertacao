@@ -43,8 +43,8 @@ def main() -> None:
 
     # Paths
     data_path = "data/monotonic_loading.out"  # Update with your actual data file path
-    weight_path = "trained_models/prnn_composite_loading_5_dense.pth"
-    csv_path = "trained_models/historico_5_dense.csv"
+    weight_path = f"trained_models/prnn_composite_loading_{num_material_points}_dense.pth"
+    csv_path = f"trained_models/historico_{num_material_points}_dense.csv"
     batch_size_train = 3
     batch_size_val = 10
     # -------------------------------------------------------------------------

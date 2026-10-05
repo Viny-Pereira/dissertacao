@@ -19,7 +19,7 @@ class LinearEncoder(Encoder):
     """
     Unconstrained linear de-homogenization layer.
     """
-    def __init__(self, in_features: int, out_features: int, 
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
                  device: Optional[torch.device] = None, dtype: torch.dtype = torch.float64):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features, bias=False, device=device, dtype=dtype)
@@ -27,7 +27,7 @@ class LinearEncoder(Encoder):
     def forward(self, macro_strain: torch.Tensor) -> torch.Tensor:
         return self.linear(macro_strain)
 
-
+'''
 class ConsistentEncoder(Encoder):
     """
     Kinematically consistent de-homogenization layer enforcing strict partition 
@@ -65,6 +65,7 @@ class ConsistentEncoder(Encoder):
         
         micro_strain = torch.matmul(a_expanded, macro_expanded).squeeze(-1) # [batch, Np, 6]
         return micro_strain.view(batch_size, self.num_points * self.dim)
+'''
 
 class EncoderFactory:
     """
@@ -72,23 +73,37 @@ class EncoderFactory:
     """
     _registry = {
         "linear": LinearEncoder,
-        "consistent": ConsistentEncoder,
-        "kinematic": ConsistentEncoder
+        #"consistent": ConsistentEncoder,
+        #"kinematic": ConsistentEncoder
     }
 
     @classmethod
-    def create(cls, encoder_type: str, num_points: int, tensor_components: int = 6, **kwargs) -> Encoder:
+    def create(cls,
+        encoder_type: str,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float64,
+        **kwargs) -> Encoder:
         constructor = cls._registry.get(encoder_type.lower())
         if constructor is None:
             raise ValueError(f"Encoder '{encoder_type}' not found. Available: {list(cls._registry.keys())}")
-        return constructor(num_material_points=num_points, tensor_components=tensor_components, **kwargs)
+        return constructor(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+            **kwargs
+        )
 
 
 class SoftLayer(Decoder):
     """
     Fully connected layer with strictly positive weights enforced via Softplus.
     """
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
                  device: torch.device = None, dtype: torch.dtype = None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
@@ -168,10 +183,10 @@ class SparseNormalizedLayer(Decoder):
     def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
         batch_size = micro_stress.size(0)
         
-        x_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
+        micro_stress_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
         normalized_weights = scalar * torch.abs(self.weights) / torch.abs(self.weights).sum(dim=0, keepdim=True)
 
-        weighted_values = x_reshaped * normalized_weights.unsqueeze(0)
+        weighted_values = micro_stress_reshaped * normalized_weights.unsqueeze(0)
         output = weighted_values.sum(dim=1)
 
         if self.bias is not None:
@@ -294,22 +309,36 @@ class DecoderFactory:
     Factory to instantiate homogenization layers based on a configuration string.
     """
     _registry = {
-        "soft": SoftLayer(),
-        "sparse_normalized":SparseNormalizedLayer(),
-        "hyper":HyperLayer(),
-        "abs_normalized":AbsNormalizedLayer()
+        "soft": SoftLayer,
+        "sparse_normalized":SparseNormalizedLayer,
+        "hyper":HyperLayer,
+        "abs_normalized":AbsNormalizedLayer
     }
 
     @classmethod
-    def create(cls, layer_type: str, in_features: int, out_features: int, **kwargs) -> Decoder:
+    def create(cls, 
+        decoder_type: str,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float64,
+        **kwargs) -> Decoder:
         """
         Instantiates and returns the requested homogenization layer.
         """
-        layer_constructor = cls._registry.get(layer_type.lower())
+        constructor = cls._registry.get(decoder_type.lower())
         
-        if layer_constructor is None:
-            raise ValueError(f"Homogenizer '{layer_type}' not found. "
+        if constructor is None:
+            raise ValueError(f"Homogenizer '{decoder_type}' not found. "
                              f"Available options: {list(cls._registry.keys())}")
             
-        return layer_constructor(in_features=in_features, out_features=out_features, **kwargs)
+        return constructor(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+            **kwargs
+        )
 

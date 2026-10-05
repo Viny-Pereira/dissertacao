@@ -3,10 +3,12 @@ Concrete implementations of the PRNN architecture.
 Separates the single-step physics (Cell) from the temporal unrolling (Sequence).
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from .interfaces import Material, PRNN, Decoder
-from .layers import DecoderFactory
+from .interfaces import Material, PRNN, Decoder, Encoder
+from .layers import DecoderFactory, EncoderFactory
 
 
 class PRNNCell(nn.Module):
@@ -16,15 +18,40 @@ class PRNNCell(nn.Module):
     model, and homogenizes the microscopic stresses back to macroscopic stresses.
     """
 
-    def __init__(self, input_size: int, output_size: int, num_material_points: int, 
-                 tensor_components: int, material_instance: Material, 
-                 decoder_type: str = 'soft', dtype: torch.dtype=torch.float64):
+    def __init__(
+        self,
+        num_material_points: int,
+        material_instance: Material,
+        dim: Optional[int] = None,
+        input_size: Optional[int] = None,
+        output_size: Optional[int] = None,
+        tensor_components: Optional[int] = None,
+        decoder_type: str = 'soft',
+        encoder_type: str = 'linear',
+        dtype: torch.dtype = torch.float64
+    ):
         super().__init__()
-        
-        self.input_size = input_size
-        self.output_size = output_size
+        if dim is not None: 
+            if dim == 2:
+                default_components = 3
+            elif dim == 3:
+                default_components = 6
+            else:
+                raise ValueError("Invalid Dimension")
+            self.input_size = input_size if input_size is not None else default_components
+            self.output_size = output_size if output_size is not None else default_components
+            self.tensor_components = tensor_components if tensor_components is not None else default_components
+        else:
+            if input_size is None or output_size is None:
+                raise ValueError(
+                    "It is mandatory to specify 'dim' (e.g., dim=3) OR both 'input_size' and 'output_size'."
+                )
+            self.input_size = input_size
+            self.output_size = output_size
+            self.tensor_components = tensor_components if tensor_components is not None else input_size
+
+        self.dim = dim
         self.num_material_points = num_material_points
-        self.tensor_components = tensor_components
         self.latent_size = self.num_material_points * self.tensor_components
         self.dtype = dtype
         
@@ -33,16 +60,19 @@ class PRNNCell(nn.Module):
 
         # 2. Encoder (Localization)
         # Maps macro-strain to latent micro-strains
-        self.encoder = nn.Linear(in_features=self.input_size, 
-                                 out_features=self.latent_size, 
-                                 bias=False,
-                                 device=material_instance.device,
-                                 dtype=self.dtype)
+        self.encoder = EncoderFactory.create(
+            encoder_type=encoder_type,
+            in_features=self.input_size, 
+            out_features=self.latent_size, 
+            bias=False,
+            device=material_instance.device,
+            dtype=self.dtype
+        )
         
         # 3. Decoder (Homogenization)
         # Calls the Factory to instantiate the requested topology automatically
-        self.decoder: Decoder = DecoderFactory.create(
-            layer_type=decoder_type,
+        self.decoder = DecoderFactory.create(
+            decoder_type=decoder_type,
             in_features=self.latent_size,
             out_features=self.output_size,
             bias=False,
@@ -71,7 +101,6 @@ class PRNNCell(nn.Module):
         raw_stress, _ = self.material.update(micro_strain_reshaped)
         micro_stress_reshaped = raw_stress.to(dtype=self.dtype)
         
-        self.material.commit()
         
         # 3. Homogenization
         micro_stress_flat = micro_stress_reshaped.view(batch_size, self.latent_size)
@@ -116,6 +145,7 @@ class PRNNSequence(PRNN):
         for t in range(seq_len):
             current_strain = macro_strain_sequence[:, t, :]
             current_stress = self.cell(current_strain)
+            self.cell.material.commit()
             output_stress_sequence[:, t, :] = current_stress
 
         return output_stress_sequence
