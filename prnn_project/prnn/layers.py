@@ -105,10 +105,9 @@ class SoftLayer(Decoder):
     """
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
                  device: torch.device = None, dtype: torch.dtype = None):
-        factory_kwargs = {'device': device, 'dtype': dtype}
+        factory_kwargs = {'device': device, 'dtype': dtype or torch.float64}
         super().__init__()
-        if dtype is None:
-            dtype = torch.float64
+
 
         self.in_features = in_features
         self.out_features = out_features
@@ -130,18 +129,18 @@ class SoftLayer(Decoder):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
-        positive_weights = self.softplus(self.weight)
-        return F.linear(micro_stress, positive_weights * scalar, self.bias)
+        positive_weight = self.softplus(self.weight)
+        return F.linear(micro_stress, positive_weight * scalar, self.bias)
 
     def get_latent(self, micro_stress: Tensor, scalar: float = 1.0) -> tuple[Tensor, Tensor]:
         """
         Returns the macroscopic stress and the isolated local stress contributions 
         before the unit-partition summation.
         """
-        positive_weights = self.softplus(self.weight) * scalar
+        positive_weight = self.softplus(self.weight) * scalar
         
         x_expanded = micro_stress.unsqueeze(1)  # [batch_size, 1, in_features]
-        w_expanded = positive_weights.unsqueeze(0)  # [1, out_features, in_features]
+        w_expanded = positive_weight.unsqueeze(0)  # [1, out_features, in_features]
         
         weighted_values = x_expanded * w_expanded  # [batch_size, out_features, in_features]
         output = weighted_values.sum(dim=2)
@@ -151,7 +150,74 @@ class SoftLayer(Decoder):
             
         return output, weighted_values
 
+class SparseLayer(Decoder):
+    """
+    Sparse homogenization layer WITHOUT partition of unity normalization (unconstrained positive weights).
+    Restricts cross-connections by linking each macroscopic stress component strictly to its 
+    corresponding microscopic stress components, without enforcing the sum-to-one constraint.
+    
+    Weight tensor shape: [out_features, num_subgroups] (e.g., [6, N_points]).
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
+                 device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        factory_kwargs = {'device': device, 'dtype': dtype or torch.float64}
+        super().__init__()
 
+        self.out_features = out_features
+        self.num_subgroups = in_features // out_features
+
+        # Initialize weight tensor with shape [out_features, num_subgroups]
+        with torch.no_grad():
+            w = torch.empty(self.out_features, self.num_subgroups, **factory_kwargs)
+            nn.init.uniform_(w, a=0.1, b=1.0)
+            
+        self.weight = nn.Parameter(w)
+
+        if bias:
+            self.bias = nn.Parameter(torch.randn(self.out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
+        batch_size = micro_stress.size(0)
+        
+        # Reshape ensuring physical continuity: [batch_size, num_subgroups, out_features]
+        micro_stress_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
+        
+        # Free positive weights (no L1 normalization across points)
+        effective_weight = scalar * torch.abs(self.weight)
+        
+        # Transpose from [out_features, num_subgroups] to [num_subgroups, out_features]
+        # and expand to [1, num_subgroups, out_features] for proper broadcasting
+        weights_aligned = effective_weight.t().unsqueeze(0)
+        
+        # Element-wise weighting: [batch, num_subgroups, out_features] * [1, num_subgroups, out_features]
+        weighted_values = micro_stress_reshaped * weights_aligned
+        
+        # Homogenization: sum across material points (dim=1) -> [batch_size, out_features]
+        output = weighted_values.sum(dim=1)
+
+        if self.bias is not None:
+            output += self.bias
+
+        return output
+
+    def get_latent(self, micro_stress: Tensor, scalar: float = 1.0) -> tuple[Tensor, Tensor]:
+        batch_size = micro_stress.size(0)
+        micro_stress_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
+        
+        effective_weight = scalar * torch.abs(self.weight)
+        weights_aligned = effective_weight.t().unsqueeze(0)
+        
+        weighted_values = micro_stress_reshaped * weights_aligned
+        output = weighted_values.sum(dim=1)
+        
+        if self.bias is not None:
+            output += self.bias
+            
+        return output, weighted_values.view(batch_size, -1)
+
+    
 class SparseNormalizedLayer(Decoder):
     """
     Sparse homogenization layer. Restricts cross-connections by linking each 
@@ -169,14 +235,14 @@ class SparseNormalizedLayer(Decoder):
         self.num_subgroups = in_features // out_features
 
         with torch.no_grad():
-            w = torch.empty(self.num_subgroups, out_features, **factory_kwargs)
+            w = torch.empty(self.out_features, self.num_subgroups, **factory_kwargs)
             nn.init.uniform_(w)
-            w = torch.abs(w) / torch.abs(w).sum(dim=0, keepdim=True)
+            w = torch.abs(w) / torch.abs(w).sum(dim=1, keepdim=True)
             
-        self.weights = nn.Parameter(w)
+        self.weight = nn.Parameter(w)
 
         if bias:
-            self.bias = nn.Parameter(torch.randn(out_features, **factory_kwargs))
+            self.bias = nn.Parameter(torch.randn(self.out_features, **factory_kwargs))
         else:
             self.register_parameter('bias', None)
 
@@ -184,9 +250,12 @@ class SparseNormalizedLayer(Decoder):
         batch_size = micro_stress.size(0)
         
         micro_stress_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
-        normalized_weights = scalar * torch.abs(self.weights) / torch.abs(self.weights).sum(dim=0, keepdim=True)
 
-        weighted_values = micro_stress_reshaped * normalized_weights.unsqueeze(0)
+        normalized_weight = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=1, keepdim=True)
+        
+        weights_aligned = normalized_weight.t().unsqueeze(0)
+        
+        weighted_values = micro_stress_reshaped * weights_aligned
         output = weighted_values.sum(dim=1)
 
         if self.bias is not None:
@@ -196,10 +265,12 @@ class SparseNormalizedLayer(Decoder):
 
     def get_latent(self, micro_stress: Tensor, scalar: float = 1.0) -> tuple[Tensor, Tensor]:
         batch_size = micro_stress.size(0)
-        x_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
+        micro_stress_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
         
-        normalized_weights = scalar * torch.abs(self.weights) / torch.abs(self.weights).sum(dim=0, keepdim=True)
-        weighted_values = x_reshaped * normalized_weights.unsqueeze(0)
+        normalized_weight = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=1, keepdim=True)
+        weights_aligned = normalized_weight.t().unsqueeze(0)
+                
+        weighted_values = micro_stress_reshaped * weights_aligned
         
         output = weighted_values.sum(dim=1)
         if self.bias is not None:
@@ -228,16 +299,16 @@ class HyperLayer(Decoder):
             nn.init.uniform_(w)
             w = torch.abs(w) / torch.abs(w).sum(dim=0, keepdim=True)
             
-        self.weights = nn.Parameter(w)
+        self.weight = nn.Parameter(w)
 
     def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
         batch_size = micro_stress.size(0)
         x_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
 
-        normalized_weights = scalar * torch.abs(self.weights) / torch.abs(self.weights).sum(dim=0, keepdim=True)
-        expanded_weights = normalized_weights.view(1, self.num_subgroups, 1)
+        normalized_weight = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=0, keepdim=True)
+        expanded_weight = normalized_weight.view(1, self.num_subgroups, 1)
 
-        weighted_values = x_reshaped * expanded_weights
+        weighted_values = x_reshaped * expanded_weight
         output = weighted_values.sum(dim=1)
 
         return output
@@ -246,10 +317,10 @@ class HyperLayer(Decoder):
         batch_size = micro_stress.size(0)
         x_reshaped = micro_stress.view(batch_size, self.num_subgroups, self.out_features)
 
-        normalized_weights = scalar * torch.abs(self.weights) / torch.abs(self.weights).sum(dim=0, keepdim=True)
-        expanded_weights = normalized_weights.view(1, self.num_subgroups, 1)
+        normalized_weight = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=0, keepdim=True)
+        expanded_weight = normalized_weight.view(1, self.num_subgroups, 1)
 
-        weighted_values = x_reshaped * expanded_weights
+        weighted_values = x_reshaped * expanded_weight
         output = weighted_values.sum(dim=1)
 
         return output, weighted_values.view(-1)
@@ -287,14 +358,14 @@ class AbsNormalizedLayer(Decoder):
             self.register_parameter('bias', None)
 
     def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
-        normalized_weights = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=1, keepdim=True)
-        return F.linear(micro_stress, normalized_weights, self.bias)
+        normalized_weight = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=1, keepdim=True)
+        return F.linear(micro_stress, normalized_weight, self.bias)
 
     def get_latent(self, micro_stress: Tensor, scalar: float = 1.0) -> tuple[Tensor, Tensor]:
-        normalized_weights = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=1, keepdim=True)
+        normalized_weight = scalar * torch.abs(self.weight) / torch.abs(self.weight).sum(dim=1, keepdim=True)
         
         x_expanded = micro_stress.unsqueeze(1)  
-        w_expanded = normalized_weights.unsqueeze(0)  
+        w_expanded = normalized_weight.unsqueeze(0)  
         
         weighted_values = x_expanded * w_expanded  
         output = weighted_values.sum(dim=2)
@@ -309,7 +380,8 @@ class DecoderFactory:
     Factory to instantiate homogenization layers based on a configuration string.
     """
     _registry = {
-        "soft": SoftLayer,
+        "dense": SoftLayer,
+        "sparse": SparseLayer,                     
         "sparse_normalized":SparseNormalizedLayer,
         "hyper":HyperLayer,
         "abs_normalized":AbsNormalizedLayer

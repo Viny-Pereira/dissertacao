@@ -10,15 +10,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import torch
-import torch.nn.functional as F
-from typing import Any
-
-import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from typing import Any, Optional, List, Tuple
 
-from .models import PRNNCell
 
 
 class Normalizer:
@@ -176,7 +172,7 @@ class Trainer:
                 predictions = self._model(inputs)
                 loss = self._criterion(predictions, targets)
                 
-                self._optimizer.zero_grad(spet_to_none=True)
+                self._optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 
                 # Aggressive gradient clipping to prevent exploding gradients in PRNN unrolling

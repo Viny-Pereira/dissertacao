@@ -4,9 +4,9 @@ Separates the single-step physics (Cell) from the temporal unrolling (Sequence).
 """
 
 from typing import Optional
-
 import torch
 import torch.nn as nn
+
 from .interfaces import Material, PRNN, Decoder, Encoder
 from .layers import DecoderFactory, EncoderFactory
 
