@@ -278,6 +278,264 @@ class SparseNormalizedLayer(Decoder):
             
         return output, weighted_values.view(-1)
 
+class DenseNormalizedLayer(Decoder):
+    """
+    Dense homogenization layer with strictly positive weights normalized along outputs.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype or torch.float64}
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_subgroups = in_features // out_features
+        self.softplus = nn.Softplus()
+
+        # Matriz densa de dimensões [out_features, in_features] -> [6, 6 * Np]
+        self.weight = nn.Parameter(
+            torch.empty((out_features, in_features), **factory_kwargs)
+        )
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(out_features, **factory_kwargs)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Kaiming uniform initialization adapted to the dense projection."""
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    @property
+    def effective_weights(self) -> Tensor:
+        """Computes row-normalized positive weights summing to 1 along dim=1."""
+        pos_weight = self.softplus(self.weight)
+        # Normalização por linha: cada componente macroscópica i soma 1 sobre as entradas
+        return pos_weight / (pos_weight.sum(dim=1, keepdim=True) + 1e-12)
+
+    def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
+        """
+        Homogenizes microscopic stresses via row-normalized dense projection.
+
+        Args:
+            micro_stress: Tensor of shape `[batch_size, in_features]`.
+            scalar: Global scaling factor applied after normalization.
+
+        Returns:
+            Macroscopic stress tensor of shape `[batch_size, out_features]`.
+        """
+        w_norm = scalar * self.effective_weights
+        return F.linear(micro_stress, w_norm, self.bias)
+
+    def get_latent(
+        self, micro_stress: Tensor, scalar: float = 1.0
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Extracts macroscopic stress alongside isolated local contributions.
+        """
+        w_norm = scalar * self.effective_weights
+
+        x_expanded = micro_stress.unsqueeze(1)  # [batch_size, 1, in_features]
+        w_expanded = w_norm.unsqueeze(0)        # [1, out_features, in_features]
+
+        # Multiplicação componente a componente antes da redução
+        weighted_values = x_expanded * w_expanded  # [batch_size, out_features, in_features]
+        output = weighted_values.sum(dim=2)
+
+        if self.bias is not None:
+            output = output + self.bias
+
+        return output, weighted_values
+
+class PointerLayer(Decoder):
+    """
+    Pointer homogenization layer enforcing dedicated identity mapping per material point.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype or torch.float64}
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_subgroups = in_features // out_features
+        self.softplus = nn.Softplus()
+
+        # Learnable scalar weight per material point [Np, 1]
+        w_init = torch.full(
+            (self.num_subgroups, 1),
+            1.0 / self.num_subgroups,
+            **factory_kwargs,
+        )
+        self.raw_weight = nn.Parameter(w_init)
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(self.out_features, **factory_kwargs)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    @property
+    def effective_weights(self) -> Tensor:
+        """Computes strictly positive weighting scalars via Softplus activation."""
+        return self.softplus(self.raw_weight)
+
+    def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
+        """
+        Homogenizes microscopic stresses into macroscopic stresses.
+        """
+        batch_size = micro_stress.size(0)
+
+        # Reshape to [batch_size, Np, out_features]
+        stress_reshaped = micro_stress.view(
+            batch_size, self.num_subgroups, self.out_features
+        )
+
+        # Expand weights to [1, Np, 1] for element-wise broadcasting
+        weights_aligned = (scalar * self.effective_weights).unsqueeze(0)
+
+        # Scale and aggregate across material points (dim=1)
+        weighted_stress = stress_reshaped * weights_aligned
+        output = weighted_stress.sum(dim=1)
+
+        if self.bias is not None:
+            output = output + self.bias
+
+        return output
+
+    def get_latent(
+        self, micro_stress: Tensor, scalar: float = 1.0
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Extracts homogenized macro stress alongside isolated micro contributions.
+        """
+        batch_size = micro_stress.size(0)
+        stress_reshaped = micro_stress.view(
+            batch_size, self.num_subgroups, self.out_features
+        )
+
+        weights_aligned = (scalar * self.effective_weights).unsqueeze(0)
+        weighted_stress = stress_reshaped * weights_aligned
+
+        output = weighted_stress.sum(dim=1)
+        if self.bias is not None:
+            output = output + self.bias
+
+        return output, weighted_stress.view(batch_size, -1)
+
+class PointerNormalizedLayer(Decoder):
+    """
+    Normalized Pointer homogenization layer enforcing partition of unity per material point.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype or torch.float64}
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_subgroups = in_features // out_features
+
+        # Initialize uniform learnable logits across material points [Np, 1]
+        with torch.no_grad():
+            w = torch.ones(self.num_subgroups, 1, **factory_kwargs)
+
+        self.raw_weight = nn.Parameter(w)
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(self.out_features, **factory_kwargs)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    @property
+    def effective_weights(self) -> Tensor:
+        """Computes strictly positive weights normalized to sum to 1 (Partition of Unity)."""
+        abs_weights = torch.abs(self.raw_weight)
+        # Normalization across all material points along dim=0
+        return abs_weights / (abs_weights.sum(dim=0, keepdim=True) + 1e-12)
+
+    def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
+        """
+        Homogenizes microscopic stresses enforcing strict partition of unity.
+
+        Args:
+            micro_stress: Tensor of shape `[batch_size, in_features]`.
+            scalar: Global scaling factor applied after normalization.
+
+        Returns:
+            Macroscopic stress tensor of shape `[batch_size, out_features]`.
+        """
+        batch_size = micro_stress.size(0)
+
+        # Reshape to [batch_size, Np, out_features]
+        stress_reshaped = micro_stress.view(
+            batch_size, self.num_subgroups, self.out_features
+        )
+
+        # Expand normalized weights to [1, Np, 1] for broadcasting
+        weights_aligned = (scalar * self.effective_weights).unsqueeze(0)
+
+        # Apply identity scaling and aggregate across material points
+        weighted_stress = stress_reshaped * weights_aligned
+        output = weighted_stress.sum(dim=1)
+
+        if self.bias is not None:
+            output = output + self.bias
+
+        return output
+
+    def get_latent(
+        self, micro_stress: Tensor, scalar: float = 1.0
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Extracts homogenized macro stress alongside isolated partitioned contributions.
+        """
+        batch_size = micro_stress.size(0)
+        stress_reshaped = micro_stress.view(
+            batch_size, self.num_subgroups, self.out_features
+        )
+
+        weights_aligned = (scalar * self.effective_weights).unsqueeze(0)
+        weighted_stress = stress_reshaped * weights_aligned
+
+        output = weighted_stress.sum(dim=1)
+        if self.bias is not None:
+            output = output + self.bias
+
+        return output, weighted_stress.view(batch_size, -1)
+
 
 class HyperLayer(Decoder):
     """
@@ -375,14 +633,18 @@ class AbsNormalizedLayer(Decoder):
             
         return output, weighted_values
 
+
 class DecoderFactory:
     """
     Factory to instantiate homogenization layers based on a configuration string.
     """
     _registry = {
         "dense": SoftLayer,
-        "sparse": SparseLayer,                     
-        "sparse_normalized":SparseNormalizedLayer,
+        "sparse": SparseLayer,
+        "pointer": PointerLayer,
+        "dense_normalized": DenseNormalizedLayer ,
+        "sparse_normalized": SparseNormalizedLayer,
+        "pointer_normalized": PointerNormalizedLayer,                     
         "hyper":HyperLayer,
         "abs_normalized":AbsNormalizedLayer
     }
