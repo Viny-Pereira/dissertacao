@@ -26,8 +26,9 @@ class PRNNCell(nn.Module):
         input_size: Optional[int] = None,
         output_size: Optional[int] = None,
         tensor_components: Optional[int] = None,
-        decoder_type: str = 'soft',
+        decoder_type: str = 'dense',
         encoder_type: str = 'linear',
+        device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64
     ):
         super().__init__()
@@ -38,6 +39,8 @@ class PRNNCell(nn.Module):
                 default_components = 6
             else:
                 raise ValueError("Invalid Dimension")
+
+            
             self.input_size = input_size if input_size is not None else default_components
             self.output_size = output_size if output_size is not None else default_components
             self.tensor_components = tensor_components if tensor_components is not None else default_components
@@ -49,11 +52,18 @@ class PRNNCell(nn.Module):
             self.input_size = input_size
             self.output_size = output_size
             self.tensor_components = tensor_components if tensor_components is not None else input_size
-
+        
+        if decoder_type.lower() == "consistent" and encoder_type.lower() != "consistent":
+            raise ValueError(
+                "Incompatibilidade termodinâmica: o decoder 'consistent' requer "
+                f"um encoder_type='consistent' (recebeu '{encoder_type}')."
+            )
+        
         self.dim = dim
         self.num_material_points = num_material_points
         self.latent_size = self.num_material_points * self.tensor_components
         self.dtype = dtype
+        self.device = device or getattr(material_instance, "device", torch.device("cpu"))
         
         # 1. Physics: The Material Model
         self.material = material_instance
@@ -65,7 +75,7 @@ class PRNNCell(nn.Module):
             in_features=self.input_size, 
             out_features=self.latent_size, 
             bias=False,
-            device=material_instance.device,
+            device=self.device,
             dtype=self.dtype
         )
         
@@ -76,8 +86,9 @@ class PRNNCell(nn.Module):
             in_features=self.latent_size,
             out_features=self.output_size,
             bias=False,
-            device=material_instance.device,       
-            dtype=self.dtype
+            device=self.device,       
+            dtype=self.dtype,
+            encoder=self.encoder
         )
 
     def forward(self, macro_strain_step: torch.Tensor) -> torch.Tensor:
@@ -141,14 +152,14 @@ class PRNNSequence(PRNN):
             device=macro_strain_sequence.device, 
             dtype=macro_strain_sequence.dtype
         )
-        
+        stress_steps = []
         for t in range(seq_len):
             current_strain = macro_strain_sequence[:, t, :]
             current_stress = self.cell(current_strain)
             self.cell.material.commit()
-            output_stress_sequence[:, t, :] = current_stress
+            stress_steps.append(current_stress)
 
-        return output_stress_sequence
+        return torch.stack(stress_steps, dim=1)
 
     def get_local_states(self, macro_strain_sequence: torch.Tensor):
         """

@@ -431,61 +431,102 @@ def plot_stress_strain_comparison(strain_seq: np.ndarray, stress_true: np.ndarra
 
 
 def inspect_human_readable_weights(cell: Any, num_points: int) -> None:
-    """
-    Imprime as matrizes de pesos do Encoder (A_ij) e Decoder (W_ij)
-    usando indexação matricial formal 6x6 por ponto material.
-    """
-    col_indices = [f"Col {j}" for j in range(1, 7)]
+  """Imprime os pesos do Encoder e Decoder adaptando-se automaticamente à topologia."""
+  col_indices = [f"Col {j}" for j in range(1, 7)]
+  header = "          " + " ".join([f"{c:>9}" for c in col_indices])
 
-    print("\n" + "=" * 78)
-    print("MATRIZES DE PESOS TREINADOS DA PRNN (ÁLGEBRA LINEAR CONSTITUTIVA)")
-    print("=" * 78)
+  print("\n" + "=" * 78)
+  print("MATRIZES DE PESOS TREINADOS DA PRNN (ÁLGEBRA LINEAR CONSTITUTIVA)")
+  print("=" * 78)
 
-    # 1. ENCODER: Matriz A^(k) [6 x 6]
-    enc_weight = getattr(cell.encoder, "weight", getattr(getattr(cell.encoder, "linear", None), "weight", None))
-    if enc_weight is None:
-        print("[Aviso] Camada linear do encoder não encontrada.")
-        return
-        
-    enc_np = enc_weight.detach().cpu().numpy()  # Formato: [Np * 6, 6]
+  # 1. ENCODER
+  if hasattr(cell.encoder, "E_raw"):
+    # ConsistentEncoder: shape [Np, 6, 6]
+    enc_np = cell.encoder.E_raw.detach().cpu().numpy()
+  else:
+    enc_w = getattr(
+        cell.encoder,
+        "weight",
+        getattr(getattr(cell.encoder, "linear", None), "weight", None),
+    )
+    enc_np = (
+        enc_w.detach().cpu().numpy().reshape(num_points, 6, 6)
+        if enc_w is not None
+        else None
+    )
 
-    print("\n[ENCODER] Matriz A^(k): eps_micro^(k) = A^(k) @ eps_macro")
+  if enc_np is not None:
+    print("\n[ENCODER] Matriz E^(k): eps_micro^(k) = E^(k) @ eps_macro")
     for k in range(num_points):
-        print(f"\n>> Ponto Material k = {k + 1} | Matriz A^({k+1}) [6x6]:")
-        block = enc_np[k * 6 : (k + 1) * 6, :]
-        
-        # Cabeçalho: Colunas j = 1..6
-        header = "          " + " ".join([f"{c:>9}" for c in col_indices])
-        print(header)
-        print("-" * len(header))
-        
-        for i, row in enumerate(block):
-            row_str = " ".join([f"{val:9.4f}" for val in row])
-            # Linha i = 1..6 -> A_i1, A_i2, ...
-            print(f" Linha {i+1} | {row_str}")
+      print(f"\n>> Ponto Material k = {k + 1} | Matriz E^({k+1}) [6x6]:")
+      print(header)
+      print("-" * len(header))
+      for i, row in enumerate(enc_np[k]):
+        row_str = " ".join([f"{val:9.4f}" for val in row])
+        print(f" Linha {i+1} | {row_str}")
 
-    # 2. DECODER: Matriz W^(k) [6 x 6]
-    dec_weight = getattr(cell.decoder, "weight", getattr(getattr(cell.decoder, "linear", None), "weight", None))
-    if dec_weight is None:
-        print("[Aviso] Camada linear do decoder não encontrada.")
-        return
+  # 2. DECODER
+  print("\n" + "-" * 78)
+  dec = cell.decoder
+  if hasattr(dec, "volume_weights"):
+    # ConsistentDecoder
+    w_np = dec.volume_weights.detach().cpu().numpy().flatten()
+    print(
+        "[DECODER CONSISTENTE] Frações de Volume w_k (D_k = w_k * E_k^T):"
+        f" {np.round(w_np, 6)}"
+    )
+    print(f"Soma dos pesos: {w_np.sum():.6f}")
+  elif hasattr(dec, "raw_weight"):
+    # PointLayer / PointNormalizedLayer
+    w_np = dec.effective_weights.detach().cpu().numpy().flatten()
+    print(
+        "[DECODER POINT] Pesos Escalares por Ponto w_k (W_k = w_k * I_6):"
+        f" {np.round(w_np, 6)}"
+    )
+    print(f"Soma dos pesos: {w_np.sum():.6f}")
+  elif hasattr(dec, "weight"):
+    w_tensor = dec.weight.detach()
+    if w_tensor.shape == (6, num_points):
+      # SparseLayer / SparseNormalizedLayer
+      if "Normalized" in dec.__class__.__name__:
+        eff_w = (
+            (
+                torch.abs(w_tensor)
+                / torch.abs(w_tensor).sum(dim=1, keepdim=True)
+            )
+            .cpu()
+            .numpy()
+        )
+      else:
+        eff_w = torch.abs(w_tensor).cpu().numpy()
+      print("[DECODER SPARSE] Pesos Diagonais por Componente [6 x N_pts]:")
+      for comp in range(6):
+        vals = " ".join([f"{eff_w[comp, k]:9.4f}" for k in range(num_points)])
+        print(f" Comp {comp+1} | {vals}")
+    else:
+      # SoftLayer / DenseNormalizedLayer / AbsNormalizedLayer [6, Np * 6]
+      if hasattr(dec, "effective_weights"):
+        eff_dec = dec.effective_weights.detach().cpu().numpy()
+      elif hasattr(dec, "softplus"):
+        eff_dec = F.softplus(w_tensor).cpu().numpy()
+      else:
+        eff_dec = (
+            (
+                torch.abs(w_tensor)
+                / torch.abs(w_tensor).sum(dim=1, keepdim=True)
+            )
+            .cpu()
+            .numpy()
+        )
 
-    # Ativação física Softplus para obter os pesos efetivos de homogeneização
-    eff_dec = F.softplus(dec_weight).detach().cpu().numpy()  # Formato: [6, Np * 6]
-
-    print("\n" + "-" * 78)
-    print("[DECODER] Matriz W^(k) = Softplus(pesos): sig_macro = sum_k W^(k) @ sig_micro^(k)")
-    for k in range(num_points):
+      print("[DECODER DENSO] Matriz W^(k) [6x6]:")
+      for k in range(num_points):
         print(f"\n>> Ponto Material k = {k + 1} | Matriz W^({k+1}) [6x6]:")
         block = eff_dec[:, k * 6 : (k + 1) * 6]
-        
-        header = "          " + " ".join([f"{c:>9}" for c in col_indices])
         print(header)
         print("-" * len(header))
-        
         for i, row in enumerate(block):
-            row_str = " ".join([f"{val:9.4f}" for val in row])
-            # Linha i = 1..6 -> W_i1, W_i2, ...
-            print(f" Linha {i+1} | {row_str}")
+          row_str = " ".join([f"{val:9.4f}" for val in row])
+          print(f" Linha {i+1} | {row_str}")
 
-    print("=" * 78 + "\n")
+  print("=" * 78 + "\n")

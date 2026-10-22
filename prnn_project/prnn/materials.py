@@ -266,79 +266,63 @@ class J2Material3DVectorized(Material):
         f_tr = q_tr - yield_stress_old
         plasticity_mask = f_tr > self.tolerance
 
-        # Initialize with elastic assumption
-        stress_updated = stress_tr.clone()
-        tangent_matrix = self.elastic_stiffness_batch.clone()
-
-        self.new_plastic_strain = self.plastic_strain.clone()
-        self.new_eq_plastic_strain = self.eq_plastic_strain.clone()
-
-        # 5. Return Mapping (Plastic Correction) via Boolean Masking
         if torch.any(plasticity_mask):
-            q_tr_p = q_tr[plasticity_mask]
-            eq_p_strain_old_p = self.eq_plastic_strain[plasticity_mask]
 
-            # Root finding for plastic multiplier
-            delta_gamma = self._find_root_3d(q_tr_p, eq_p_strain_old_p)
+            delta_gamma_raw = self._find_root_3d(q_tr, self.eq_plastic_strain)
+            delta_gamma = torch.where(
+                plasticity_mask, delta_gamma_raw, torch.zeros_like(delta_gamma_raw)
+            )
 
-            # Plastic flow direction: n = (3/2) * s / q
-            n_dir = 1.5 * s_tr[plasticity_mask] / q_tr_p.unsqueeze(1)
+            # Direção do fluxo plástico: n = (3/2) * s / q
+            n_dir = 1.5 * s_tr / q_tr.unsqueeze(1)
 
-            # Update scalar history
-            self.new_eq_plastic_strain[plasticity_mask] += delta_gamma
+            # Atualização out-of-place das variáveis de histórico
+            self.new_eq_plastic_strain = self.eq_plastic_strain + delta_gamma
 
-            # Update tensorial plastic strain (accounting for Voigt shear factor 2)
             d_eps_p = delta_gamma.unsqueeze(1) * n_dir
-            d_eps_p[:, 3:] *= 2.0
-            self.new_plastic_strain[plasticity_mask] += d_eps_p
+            d_eps_p = torch.cat([d_eps_p[:, :3], 2.0 * d_eps_p[:, 3:]], dim=1)
+            self.new_plastic_strain = self.plastic_strain + d_eps_p
 
-            # Update Stress (Radial Return)
-            stress_updated[plasticity_mask] -= 2.0 * self.shear_modulus * delta_gamma.unsqueeze(1) * n_dir
+            # Atualização out-of-place da tensão (Retorno Radial)
+            stress_plastic = (
+                stress_tr
+                - 2.0 * self.shear_modulus * delta_gamma.unsqueeze(1) * n_dir
+            )
+            stress_updated = torch.where(
+                plasticity_mask.unsqueeze(1), stress_plastic, stress_tr
+            )
+        else:
+            stress_updated = stress_tr
+            self.new_plastic_strain = self.plastic_strain
+            self.new_eq_plastic_strain = self.eq_plastic_strain
 
-            # 6. Consistent Algorithmic Tangent Matrix
-            h_modulus = self._hardening_modulus(eq_p_strain_old_p + delta_gamma)
+        return stress_updated, self.elastic_stiffness_batch
 
-            theta1 = 1.0 - (3.0 * self.shear_modulus * delta_gamma) / q_tr_p
-            theta2 = ((3.0 * self.shear_modulus) / (3.0 * self.shear_modulus + h_modulus) 
-                      - (3.0 * self.shear_modulus * delta_gamma) / q_tr_p)
-
-            i_dev_batch = self.i_dev.unsqueeze(0).repeat(delta_gamma.size(0), 1, 1)
-            i_vol_batch = self.i_vol.unsqueeze(0).repeat(delta_gamma.size(0), 1, 1)
-
-            # n tensor n (outer product in Voigt)
-            n_tensor_n = torch.bmm(n_dir.unsqueeze(2), n_dir.unsqueeze(1))
-
-            c_algorithmic = (self.bulk_modulus * i_vol_batch +
-                             2.0 * self.shear_modulus * theta1.unsqueeze(1).unsqueeze(2) * i_dev_batch -
-                             (4.0 / 3.0) * self.shear_modulus * theta2.unsqueeze(1).unsqueeze(2) * n_tensor_n)
-
-            tangent_matrix[plasticity_mask] = c_algorithmic
-
-        return stress_updated, tangent_matrix
-
-    def _find_root_3d(self, q_tr: torch.Tensor, eq_p_strain_old: torch.Tensor) -> torch.Tensor:
-        """Scalar Newton-Raphson for the Return Mapping algorithm."""
+    def _find_root_3d(
+        self, q_tr: torch.Tensor, eq_p_strain_old: torch.Tensor
+    ) -> torch.Tensor:
+      """Scalar Newton-Raphson sem operações in-place destrutivas."""
+      with torch.no_grad():
         delta_gamma = torch.zeros_like(q_tr)
-
         for _ in range(self.max_iterations):
-            f_val = q_tr - 3.0 * self.shear_modulus * delta_gamma - self._yield_stress(eq_p_strain_old + delta_gamma)
-
-            converged = torch.abs(f_val) < self.tolerance
-            if torch.all(converged):
-                break
-
-            h_prime = self._hardening_modulus(eq_p_strain_old + delta_gamma)
-            f_der = -3.0 * self.shear_modulus - h_prime
-
-            d_delta_gamma = f_val / f_der
-            delta_gamma -= d_delta_gamma * ~converged
-
-        return delta_gamma
+          f_val = (
+              q_tr
+              - 3.0 * self.shear_modulus * delta_gamma
+              - self._yield_stress(eq_p_strain_old + delta_gamma)
+          )
+          converged = torch.abs(f_val) < self.tolerance
+          if torch.all(converged):
+            break
+          h_prime = self._hardening_modulus(eq_p_strain_old + delta_gamma)
+          f_der = -3.0 * self.shear_modulus - h_prime
+          d_delta_gamma = f_val / f_der
+          delta_gamma = delta_gamma - d_delta_gamma * (~converged)
+      return delta_gamma
 
     def commit(self) -> None:
         """Commits the converged internal history variables."""
-        self.plastic_strain = self.new_plastic_strain.clone()
-        self.eq_plastic_strain = self.new_eq_plastic_strain.clone()
+        self.plastic_strain = self.new_plastic_strain.detach()
+        self.eq_plastic_strain = self.new_eq_plastic_strain.detach()
 
     def get_history(self) -> torch.Tensor:
         """Returns the accumulated equivalent plastic strain."""

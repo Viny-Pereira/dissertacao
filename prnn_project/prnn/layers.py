@@ -67,12 +67,44 @@ class ConsistentEncoder(Encoder):
         return micro_strain.view(batch_size, self.num_points * self.dim)
 '''
 
+class ConsistentEncoder(Encoder):
+    r"""
+    Kinematic concentration layer storing localized deformation operators E_j.
+    Mapping: eps_j = E_j * eps_macro
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
+                 device: Optional[torch.device] = None, dtype: torch.dtype = torch.float64):
+        super().__init__()
+        self.dim = in_features
+        self.num_points = out_features // in_features
+        self.device = device or torch.device("cpu")
+        self.dtype = dtype
+
+        factory_kwargs = {'device': self.device, 'dtype': self.dtype}
+
+        # Inicializa cada E_j como a identidade 6x6 com pequena perturbação
+        e_init = torch.eye(self.dim, **factory_kwargs).repeat(self.num_points, 1, 1)
+        perturbation = torch.randn((self.num_points, self.dim, self.dim), **factory_kwargs) * 1e-3
+        
+        # Tensor de parâmetros [m, 6, 6]
+        self.E_raw = nn.Parameter(e_init + perturbation)
+
+    def forward(self, macro_strain: Tensor) -> Tensor:
+        batch_size = macro_strain.size(0)
+        macro_expanded = macro_strain.unsqueeze(1).unsqueeze(-1)         # [batch, 1, 6, 1]
+        e_expanded = self.E_raw.unsqueeze(0)                             # [1, m, 6, 6]
+        
+        micro_strain = torch.matmul(e_expanded, macro_expanded).squeeze(-1) # [batch, m, 6]
+        return micro_strain.view(batch_size, self.num_points * self.dim)
+
+
 class EncoderFactory:
     """
     Factory to instantiate kinematic de-homogenization layers via class registry.
     """
     _registry = {
         "linear": LinearEncoder,
+        "consistent": ConsistentEncoder,
         #"consistent": ConsistentEncoder,
         #"kinematic": ConsistentEncoder
     }
@@ -362,9 +394,9 @@ class DenseNormalizedLayer(Decoder):
 
         return output, weighted_values
 
-class PointerLayer(Decoder):
+class PointLayer(Decoder):
     """
-    Pointer homogenization layer enforcing dedicated identity mapping per material point.
+    Point homogenization layer enforcing dedicated identity mapping per material point.
     """
 
     def __init__(
@@ -446,7 +478,7 @@ class PointerLayer(Decoder):
 
         return output, weighted_stress.view(batch_size, -1)
 
-class PointerNormalizedLayer(Decoder):
+class PointNormalizedLayer(Decoder):
     """
     Normalized Pointer homogenization layer enforcing partition of unity per material point.
     """
@@ -536,6 +568,82 @@ class PointerNormalizedLayer(Decoder):
 
         return output, weighted_stress.view(batch_size, -1)
 
+class ConsistentDecoder(Decoder):
+    r"""
+    Thermodynamic dual homogenization layer satisfying Hill-Mandel:
+        sigma_macro = sum_j ( w_j * E_j^T * sigma_j )
+    Weights E_j are strictly tied to the ConsistentEncoder instance.
+    """
+    def __init__(self,
+      in_features: int,
+      out_features: int,
+      encoder: ConsistentEncoder,
+      normalize_weights: bool = True,
+      bias: bool = False,
+      device: Optional[torch.device] = None,
+      dtype: Optional[torch.dtype] = None,
+      **kwargs,):
+        
+        super().__init__()
+        self.encoder = encoder
+        self.num_points = encoder.num_points
+        self.dim = encoder.dim
+        self.normalize_weights = normalize_weights
+        
+        factory_kwargs = {'device': device or encoder.device, 'dtype': dtype or encoder.dtype}
+        
+        # Frações de volume w_j [m, 1]
+        w_init = torch.full((self.num_points, 1), 1.0 / self.num_points, **factory_kwargs)
+        self.w_raw = nn.Parameter(w_init)
+        self.softplus = nn.Softplus()
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(self.dim, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+
+    @property
+    def volume_weights(self) -> Tensor:
+        """Retorna w_j estritamente positivos (e normalizados se ativado)."""
+        w_pos = self.softplus(self.w_raw)
+        if self.normalize_weights:
+            return w_pos / (w_pos.sum(dim=0, keepdim=True) + 1e-12)
+        return w_pos
+
+    def forward(self, micro_stress: Tensor, scalar: float = 1.0) -> Tensor:
+        batch_size = micro_stress.size(0)
+        stress_blocked = micro_stress.view(batch_size, self.num_points, self.dim).unsqueeze(-1) # [batch, m, 6, 1]
+        
+        # Pega E_raw diretamente do encoder e transpõe: [1, m, 6, 6]
+        e_t = self.encoder.E_raw.transpose(-2, -1).unsqueeze(0)
+        
+        # E_j^T * sigma_j -> [batch, m, 6]
+        pulled_stress = torch.matmul(e_t, stress_blocked).squeeze(-1)
+        
+        # w_j alinhado: [1, m, 1]
+        w = (scalar * self.volume_weights).t().unsqueeze(0).transpose(1, 2)
+        
+        # sigma_macro = sum_j ( w_j * E_j^T * sigma_j )
+        macro_stress = (pulled_stress * w).sum(dim=1)
+        
+        if self.bias is not None:
+            macro_stress = macro_stress + self.bias
+            
+        return macro_stress
+
+    def get_latent(self, micro_stress: Tensor, scalar: float = 1.0) -> tuple[Tensor, Tensor]:
+        batch_size = micro_stress.size(0)
+        stress_blocked = micro_stress.view(batch_size, self.num_points, self.dim).unsqueeze(-1)
+        e_t = self.encoder.E_raw.transpose(-2, -1).unsqueeze(0)
+        pulled_stress = torch.matmul(e_t, stress_blocked).squeeze(-1)
+        w = (scalar * self.volume_weights).t().unsqueeze(0).transpose(1, 2)
+        weighted_values = pulled_stress * w
+        macro_stress = weighted_values.sum(dim=1)
+        
+        if self.bias is not None:
+            macro_stress = macro_stress + self.bias
+            
+        return macro_stress, weighted_values.view(batch_size, -1)
 
 class HyperLayer(Decoder):
     """
@@ -641,10 +749,11 @@ class DecoderFactory:
     _registry = {
         "dense": SoftLayer,
         "sparse": SparseLayer,
-        "pointer": PointerLayer,
+        "point": PointLayer,
         "dense_normalized": DenseNormalizedLayer ,
         "sparse_normalized": SparseNormalizedLayer,
-        "pointer_normalized": PointerNormalizedLayer,                     
+        "point_normalized": PointNormalizedLayer,
+        "consistent": ConsistentDecoder,
         "hyper":HyperLayer,
         "abs_normalized":AbsNormalizedLayer
     }
@@ -666,7 +775,8 @@ class DecoderFactory:
         if constructor is None:
             raise ValueError(f"Homogenizer '{decoder_type}' not found. "
                              f"Available options: {list(cls._registry.keys())}")
-            
+        if constructor is not ConsistentDecoder:
+            kwargs.pop("encoder", None)
         return constructor(
             in_features=in_features,
             out_features=out_features,

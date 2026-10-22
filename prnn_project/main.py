@@ -13,7 +13,6 @@ from prnn.utils import StressStrainDataset, Trainer
 
 def run_experiment(cfg: SimulationConfig) -> None:
     """Orquestra a inicialização, treino, cronometragem e gravação de um ensaio."""
-    # 10 workers * 4 threads = 40 threads ativas (seguro para CPU de 64 núcleos)
     num_threads_per_worker = 4
     torch.set_num_threads(num_threads_per_worker)
     torch.set_num_interop_threads(1)
@@ -27,7 +26,7 @@ def run_experiment(cfg: SimulationConfig) -> None:
         f"[PID {os.getpid()}] Iniciando: {cfg.num_material_points} pts | Seed: {cfg.random_seed}"
     )
 
-    # 1. Carregamento de dados com Split fixo (100 Treino / 150 Validação) condicionado à Seed
+    # 1. Carregamento de dados com Split fixo
     full_dataset = StressStrainDataset(
         filename=cfg.data_path,
         features=cfg.features,
@@ -47,7 +46,6 @@ def run_experiment(cfg: SimulationConfig) -> None:
             f"mas são necessárias pelo menos {n_train + n_val} (100 treino + 150 teste)."
         )
 
-    # Gerador determinístico baseado na seed do ensaio
     generator = torch.Generator().manual_seed(cfg.random_seed)
     n_unused = total_trajectories - (n_train + n_val)
 
@@ -71,7 +69,7 @@ def run_experiment(cfg: SimulationConfig) -> None:
         val_dataset, batch_size=cfg.batch_size_val, shuffle=False
     )
 
-    # 2. Construção do modelo PRNN
+    # 2. Construção do modelo PRNN (Agora recebe o encoder_type explicitamente)
     material = J2Material3DVectorized(device=cfg.device, dtype=cfg.dtype)
     cell = PRNNCell(
         input_size=len(cfg.features),
@@ -79,12 +77,14 @@ def run_experiment(cfg: SimulationConfig) -> None:
         num_material_points=cfg.num_material_points,
         tensor_components=cfg.tensor_components,
         material_instance=material,
+        encoder_type=getattr(cfg, 'encoder_type', 'linear'),  # <-- AJUSTE AQUI
         decoder_type=cfg.decoder_type,
+        device=cfg.device,
         dtype=cfg.dtype,
     )
     model = PRNNSequence(cell=cell).to(device=cfg.device, dtype=cfg.dtype)
 
-    # 3. Otimizador sem scheduler (taxa constante)
+    # 3. Otimizador sem scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
 
     # 4. Treino com Cronometragem
@@ -107,7 +107,7 @@ def run_experiment(cfg: SimulationConfig) -> None:
     epochs_run = len(trainer.train_losses)
     sec_per_epoch = total_time_sec / epochs_run if epochs_run > 0 else 0.0
 
-    # 5. Salva o Histórico de Convergência com Metadados de Tempo (.csv)
+    # 5. Salva o Histórico (.csv)
     os.makedirs(os.path.dirname(cfg.csv_path), exist_ok=True)
     history_data = np.column_stack((trainer.train_losses, trainer.val_losses))
 
@@ -141,12 +141,20 @@ def main():
 
     pontos_para_testar = [x + 1 for x in range(10)]
     seeds = [1, 7, 12, 24, 30, 42, 51, 68, 77, 100]
-    decoder = "dense"
-
+    
+    
+    encoder = "linear"
+    decoder = "point"
+   
+    """ 
+    encoder = "consistent"
+    decoder = "consistent"
+    """
+    
     max_workers = len(pontos_para_testar)
     for seed in seeds:
         print(f"\n{'='*70}")
-        print(f"DISPARANDO BATELADA EM PARALELO PARA SEED: {seed} ({max_workers} PROCESSOS SIMULTÂNEOS)")
+        print(f"A DISPARAR LOTE EM PARALELO PARA A SEED: {seed} ({max_workers} PROCESSOS SIMULTÂNEOS)")
         print(f"{'='*70}")
 
         configs = []
@@ -156,9 +164,10 @@ def main():
                 weight_path=os.path.join(output_dir, f"GP-prnn_pts{n_pts}_{decoder}_seed{seed}.pth"),
                 csv_path=os.path.join(output_dir, f"GP-history_pts{n_pts}_{decoder}_seed{seed}.csv"),
                 num_material_points=n_pts,
+                encoder_type=encoder, 
                 decoder_type=decoder,
-                batch_size_train=10,  # Ajustado para 10 (com 100 amostras gera 10 passos por época)
-                batch_size_val=25,    # Ajustado para 25 (com 150 amostras gera 6 passos de validação)
+                batch_size_train=10,
+                batch_size_val=25,
                 learning_rate=1e-3,
                 epochs=10000,
                 patience=500,

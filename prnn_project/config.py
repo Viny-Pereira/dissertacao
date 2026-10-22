@@ -14,7 +14,8 @@ class SimulationConfig:
     # 2. Arquitetura da PRNN
     num_material_points: int = 5
     tensor_components: int = 6
-    decoder_type: str = 'soft'
+    encoder_type: str = 'linear'
+    decoder_type: str = 'dense'
     normalize_features: bool = False
     
     # 3. Hiperparâmetros de Treinamento

@@ -12,8 +12,8 @@ from prnn.visualization import plot_publication_prnn
 def main():
     num_material_points = 5
     input_file_name = "data/monotonic_loading.out"
-    weight_file_name = f"benchmark_points/prnn_pts{num_material_points}_soft.pth"
-    decoder_type = "soft"
+    weight_file_name = f"benchmark_points/prnn_pts{num_material_points}_dense.pth"
+    decoder_type = "dense"
     encoder_type = "linear"
     curvas_para_plotar = [2, 20, 45]  # Curvas garantidas dentro dos limites usuais
 
