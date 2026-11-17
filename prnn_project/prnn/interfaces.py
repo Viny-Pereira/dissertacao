@@ -1,100 +1,86 @@
 """
 Abstract base classes for Physically Recurrent Neural Networks (PRNN).
-Follows PEP 8 styling and PEP 484 type hinting.
 """
 
 from abc import ABC, abstractmethod
+from typing import Optional
 import torch
 import torch.nn as nn
+from torch import Tensor
 
-
-class Material(nn.Module, ABC):
+class ConstitutiveModel(nn.Module, ABC):
     """
     Abstract base class for physical constitutive models.
     """
 
     @abstractmethod
-    def configure(self, total_points: int, tensor_components: int) -> None:
+    def configure(self, total_points: int, tensor_components: int = 6) -> None:
         """
-        Allocates memory and initializes history tensors.
+        Allocates memory and initializes converged/trial history tensors.
 
         Args:
-            total_points (int): Batch size multiplied by the number of material points.
-            tensor_components (int): Number of stress/strain components (e.g., 3 or 6).
+            total_points: Batch size multiplied by the number of material points.
+            tensor_components: Number of stress/strain components (e.g., 3 or 6).
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
-    def update(self, micro_strain: torch.Tensor) -> torch.Tensor:
+    def stress(self, micro_strain: Tensor) -> Tensor:
         """
         Computes local stresses from local strains using a vectorized return mapping.
 
         Args:
-            micro_strain (torch.Tensor): Tensor of shape [total_points, tensor_components].
+            micro_strain (Tensor): Tensor of shape [total_points, tensor_components].
 
         Returns:
-            torch.Tensor: Micro-stress tensor of shape [total_points, tensor_components].
+            Tensor: Micro-stress tensor of shape [total_points, tensor_components].
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def commit(self) -> None:
         """
         Commits the converged internal history variables for the next time step.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
-    def get_history(self) -> torch.Tensor:
+    def cancel(self) -> None:
+        """
+        Reverts trial state variables back to the last committed state (used when
+        Newton-Raphson diverges or during observe() queries).
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def get_history(self) -> Tensor:
         """
         Retrieves internal variables (e.g., accumulated plasticity, damage).
 
         Returns:
-            torch.Tensor: Internal history tensor.
+            Tensor: Internal history tensor.
         """
-        pass
+        raise NotImplementedError
 
-
-class PRNN(nn.Module, ABC):
-    """
-    Abstract base class for PRNN models.
-    """
-
-    @abstractmethod
-    def forward(self, macro_strain_sequence: torch.Tensor) -> torch.Tensor:
-        """
-        Processes a full temporal sequence of macroscopic strains.
-
-        Args:
-            macro_strain_sequence (torch.Tensor): Shape [batch_size, seq_len, input_size].
-
-        Returns:
-            torch.Tensor: Predicted macro-stress sequence.
-        """
-        pass
-
-    @abstractmethod
-    def get_local_states(self, macro_strain_sequence: torch.Tensor) -> tuple:
-        """
-        Retrieves internal latent variables across the deformation path.
-        """
-        pass
 
 
 class Encoder(nn.Module, ABC):
     """
     Abstract interface for kinematic de-homogenization layers (macro -> micro strain).
     """
+
     @abstractmethod
-    def forward(self, macro_strain: torch.Tensor) -> torch.Tensor:
+    def forward(self, macro_strain: Tensor) -> Tensor:
         """
         Maps macroscopic strain to flattened microscopic strain fields.
+
         Args:
-            macro_strain (torch.Tensor): Shape [batch_size, input_dim].
+            macro_strain (Tensor): Shape [batch_size, input_dim].
+        
         Returns:
-            torch.Tensor: Flattened micro-strains [batch_size, num_points * tensor_components].
+            Tensor: Flattened micro-strains [batch_size, num_points * tensor_components].
         """
-        pass
+        raise NotImplementedError
 
 class Decoder(nn.Module, ABC):
     """
@@ -105,30 +91,71 @@ class Decoder(nn.Module, ABC):
         super().__init__()
 
     @abstractmethod
-    def forward(self, x: torch.Tensor, scalar: float = 1.0) -> torch.Tensor:
+    def forward(
+        self,
+        micro_stress: Tensor,
+        scalar: float = 1.0,
+        e_raw: Optional[Tensor] = None,
+    ) -> Tensor:
         """
-        Computes the final macroscopic stress.
+        Computes the homogenized macroscopic stress.
 
         Args:
-            x (Tensor): The micro-stress tensor. Shape [batch_size, latent_size].
-            scalar (float, optional): Scaling factor. Defaults to 1.0.
+            micro_stress: Micro-stress tensor of shape [batch_size, n_latents].
+            scalar: Optional global scaling factor. Defaults to 1.0.
+            e_raw: Optional localization tensor [n_matpts, n_features, n_features]
+                required by thermodynamically consistent decoders.
 
         Returns:
-            Tensor: The homogenized macroscopic stress.
+            Homogenized macroscopic stress tensor of shape [batch_size, n_outputs].
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
-    def get_latent(self, x: torch.Tensor, scalar: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_latent(
+        self,
+        micro_stress: Tensor,
+        scalar: float = 1.0,
+        e_raw: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor]:
         """
-        Returns the macroscopic stress alongside the local weighted latent fields.
-
-        Args:
-            x (Tensor): The micro-stress tensor. Shape [batch_size, latent_size].
-            scalar (float, optional): Scaling factor. Defaults to 1.0.
-
-        Returns:
-            tuple[Tensor, Tensor]: A tuple containing the macroscopic stress and 
-                                   the intermediate weighted latent values.
+        Returns the macroscopic stress alongside the isolated local weighted contributions.
         """
-        pass
+        raise NotImplementedError
+
+
+class PRNN(nn.Module, ABC):
+    """
+    Abstract base class for PRNN models.
+    """
+
+    @abstractmethod
+    def forward(self, x: Tensor) -> Tensor:
+        """Offline training forward pass over batched strain sequences [batch, seq_len, n_features]."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def evaluate(self, strain: Tensor) -> Tensor:
+        """Online trial evaluation for a single step without committing history."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit(self) -> None:
+        """Commits converged internal material state at the end of a load step."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel(self) -> None:
+        """Reverts trial material state to the last committed step."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def observe(self, strain: Tensor) -> Tensor:
+        """Evaluates stress for post-processing/output without altering pending Newton trials."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Resets internal online material context for a new boundary value problem."""
+        raise NotImplementedError
+

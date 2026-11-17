@@ -9,8 +9,8 @@ import random
 import os
 
 # Import modules from our custom 'prnn' package
-from prnn.materials import J2Material3DVectorized
-from prnn.models import PRNNCell, PRNNSequence
+from prnn.constitutive import J2Material3DVectorized
+from dissertacao.prnn_project.prnn.prnn import PRNNCell, PRNNSequence
 from prnn.utils import StressStrainDataset, train_and_save_model, plot_convergence_from_csv
 
 

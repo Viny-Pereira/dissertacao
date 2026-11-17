@@ -3,8 +3,8 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader, Subset
 
-from prnn.materials import J2Material3DVectorized
-from prnn.models import PRNNCell, PRNNSequence
+from prnn.constitutive import J2Material3DVectorized
+from dissertacao.prnn_project.prnn.prnn import PRNNCell, PRNNSequence
 from prnn.utils import StressStrainDataset, Trainer, inspect_human_readable_weights
 from prnn.visualization import plot_publication_prnn
 
